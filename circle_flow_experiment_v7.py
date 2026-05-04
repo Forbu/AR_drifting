@@ -191,7 +191,11 @@ def train_decoupled(dataset, s_max=1.0, hidden_dim=256, n_layers=5,
         for x_cond, y_target in dataset.get_batches(batch_size):
             B = x_cond.shape[0]
             t = torch.rand(B, 1, device=device)
-            s = torch.rand(B, 1, device=device) * s_max
+            # LogNormal-skewed s: heavy bias toward 1 (noisy conditions)
+            # Hypothesis: learning to stay on manifold is harder than learning rotation,
+            # so over-expose the model to noisy conditions during training.
+            eps_s = torch.randn(B, 1, device=device)
+            s = (torch.sigmoid(1.4 + 2.0 * eps_s).clamp(1e-4, 1 - 1e-4) * s_max)
 
             # Output interpolation
             eps = torch.randn_like(y_target)
