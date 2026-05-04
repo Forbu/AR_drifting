@@ -17,10 +17,14 @@ Data generation:
   3. Step: x' = x + speed * v, then re-normalize to the sphere
   4. Repeat for multi-step transitions
 
-Training: Same three modes as v7:
-  - baseline:   clean condition, no condition noise parameter
-  - coupled:    condition noise tied to output time s = t
-  - decoupled:  independent t (output) and s (condition) noise schedules
+Training modes compared:
+  - baseline:             clean condition, no condition noise parameter
+  - coupled:              condition noise tied to output time s = t
+  - decoupled-conditional: independent t and s, model receives s as input
+  - decoupled-unconditional: independent t and s at training, but model
+                             does NOT receive s — must handle all noise
+                             levels blindly (ablation: isolates training
+                             diversity from s-informed inference)
 
 Evaluation:
   - Norm drift:  ||x|| should stay ≈ 1.0 across AR steps
@@ -176,6 +180,40 @@ class FlowMLPDecoupled(nn.Module):
         return (x_pred - z_t) / (1 - t).clamp(min=0.01)
 
 
+class FlowMLPDecoupledUncond(nn.Module):
+    """
+    Unconditional decoupled rectified flow.
+    Same architecture as Baseline (no s input), but trained with random
+    condition noise s ~ U(0,1) — the model must learn to denoise the
+    output regardless of how noisy the condition is, WITHOUT being told
+    the noise level.
+
+    This isolates the effect of training diversity (seeing noisy conditions)
+    from the effect of conditioning on s (informing the model about noise).
+
+    Input:  [z_t, c_s, t]  →  velocity in R^D
+    """
+    def __init__(self, D, hidden_dim=256, n_layers=5):
+        super().__init__()
+        self.D = D
+        layers = []
+        in_dim = 2 * D + 1  # same as baseline: no s input
+        for i in range(n_layers):
+            out_dim = D if i == n_layers - 1 else hidden_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < n_layers - 1:
+                layers.append(nn.SiLU())
+            in_dim = out_dim
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z_t, c_s, t):
+        return self.net(torch.cat([z_t, c_s, t], dim=-1))
+
+    def get_velocity(self, z_t, c_s, t):
+        x_pred = self.forward(z_t, c_s, t)
+        return (x_pred - z_t) / (1 - t).clamp(min=0.01)
+
+
 class FlowMLPBaseline(nn.Module):
     """
     Standard conditional rectified flow.
@@ -233,6 +271,57 @@ def train_decoupled(dataset, s_max=1.0, hidden_dim=256, n_layers=5,
             c_s = (1 - s) * x_cond + s * eps_cond
 
             v_pred = model.get_velocity(z_t, c_s, t, s)
+            loss = ((v_pred - v_target) ** 2).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        scheduler.step()
+        avg = epoch_loss / n_batches
+        losses.append(avg)
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            print(f"    [{label}] epoch {epoch+1:4d}/{n_epochs}  loss={avg:.6f}")
+
+    return model, losses
+
+
+def train_decoupled_uncond(dataset, s_max=1.0, hidden_dim=256, n_layers=5,
+                             n_epochs=300, batch_size=512, lr=1e-3, device='cuda'):
+    """
+    Train unconditional decoupled: condition noise s ~ U(0,s_max) is applied
+    during training, but s is NOT passed to the model. The model must handle
+    arbitrary condition noise without knowing its level.
+    """
+    D = dataset.D
+    model = FlowMLPDecoupledUncond(D, hidden_dim=hidden_dim, n_layers=n_layers).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    label = f'decoupled-uncond(s_max={s_max})'
+    losses = []
+    for epoch in range(n_epochs):
+        epoch_loss, n_batches = 0.0, 0
+        for x_cond, y_target in dataset.get_batches(batch_size):
+            B = x_cond.shape[0]
+            t = torch.rand(B, 1, device=device)
+
+            # Same s distribution as conditional decoupled
+            eps_s = torch.randn(B, 1, device=device)
+            s = (torch.sigmoid(1.4 + 2.0 * eps_s).clamp(1e-4, 1 - 1e-4) * s_max)
+
+            eps = torch.randn_like(y_target)
+            z_t = (1 - t) * eps + t * y_target
+            v_target = y_target - eps
+
+            # Condition noise — same as conditional decoupled
+            eps_cond = torch.randn_like(x_cond)
+            c_s = (1 - s) * x_cond + s * eps_cond
+
+            # But model does NOT receive s
+            v_pred = model.get_velocity(z_t, c_s, t)
             loss = ((v_pred - v_target) ** 2).mean()
 
             optimizer.zero_grad(set_to_none=True)
@@ -351,6 +440,29 @@ def sample_next_decoupled(model, x_cond, n_ode_steps=50, infer_s=0.0):
 
 
 @torch.no_grad()
+def sample_next_decoupled_uncond(model, x_cond, n_ode_steps=50):
+    """
+    Sample with unconditional decoupled model.
+    Always uses clean condition (s=0) since model was trained blind to s
+    and must handle any condition quality. At inference we give it the best
+    condition we have.
+    """
+    B, D = x_cond.shape
+    device = x_cond.device
+    z = torch.randn(B, D, device=device)
+    dt = 1.0 / n_ode_steps
+
+    for i in range(n_ode_steps):
+        t_val = i * dt
+        t = torch.full((B, 1), t_val, device=device)
+        # Clean condition — model was trained to handle this
+        v = model.get_velocity(z, x_cond, t)
+        z = z + v * dt
+
+    return z
+
+
+@torch.no_grad()
 def sample_next_coupled(model, x_cond, n_ode_steps=50, infer_noisy=True):
     B, D = x_cond.shape
     device = x_cond.device
@@ -412,6 +524,8 @@ def autoregressive_rollout(model, start, n_ar_steps=200, n_ode_steps=50,
             else:
                 s = infer_s
             current = sample_next_decoupled(model, current, n_ode_steps, infer_s=s)
+        elif mode == 'decoupled-uncond':
+            current = sample_next_decoupled_uncond(model, current, n_ode_steps)
         elif mode == 'coupled':
             current = sample_next_coupled(model, current, n_ode_steps,
                                           infer_noisy=coupled_noisy)
@@ -810,7 +924,7 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
     model_coupled.eval()
     print(f"    Done in {time.time()-t0:.1f}s")
 
-    print(f"\n  Training [decoupled] model...")
+    print(f"\n  Training [decoupled-conditional] model...")
     t0 = time.time()
     model_decoupled, losses_decoupled = train_decoupled(
         dataset, s_max=1.0,
@@ -819,6 +933,17 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
         lr=1e-3, device=device,
     )
     model_decoupled.eval()
+    print(f"    Done in {time.time()-t0:.1f}s")
+
+    print(f"\n  Training [decoupled-unconditional] model...")
+    t0 = time.time()
+    model_decoupled_uncond, losses_decoupled_uncond = train_decoupled_uncond(
+        dataset, s_max=1.0,
+        hidden_dim=cfg['hidden_dim'], n_layers=cfg['n_layers'],
+        n_epochs=cfg['n_epochs'], batch_size=cfg['batch_size'],
+        lr=1e-3, device=device,
+    )
+    model_decoupled_uncond.eval()
     print(f"    Done in {time.time()-t0:.1f}s")
 
     # --- Starting points on the sphere ---
@@ -848,7 +973,7 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
         res = evaluate_rollout(traj)
         res['losses'] = losses
         res['mode'] = mode
-        res['infer_s'] = infer_s if mode == 'decoupled' else None
+        res['infer_s'] = infer_s if mode in ('decoupled', 'decoupled-uncond') else None
         print(f"    Final: ||x||_mean={res['norm_mean'][-1]:.4f}  "
               f"norm_error={res['norm_error'][-1]:.4f}  "
               f"angular_disp={res['angular_displacement'][-1]:.3f} rad")
@@ -874,13 +999,18 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
     do_rollout(f'D={D} spd={speed} coupled/clean',
                model_coupled, 'coupled', coupled_noisy=False, losses=losses_coupled)
 
-    # 5) Decoupled with fixed s values
+    # 5) Decoupled unconditional (blind to s, trained with noisy conditions)
+    do_rollout(f'D={D} spd={speed} decoupled-uncond',
+               model_decoupled_uncond, 'decoupled-uncond',
+               losses=losses_decoupled_uncond)
+
+    # 6) Decoupled conditional with fixed s values
     for s_val in infer_s_values:
         do_rollout(f'D={D} spd={speed} decoupled/s={s_val}',
                    model_decoupled, 'decoupled', infer_s=s_val,
                    losses=losses_decoupled)
 
-    # 6) Decoupled with s ramp
+    # 7) Decoupled conditional with s ramp
     for ramp_max in s_ramp_values:
         do_rollout(f'D={D} spd={speed} decoupled/ramp→{ramp_max}',
                    model_decoupled, 'decoupled', s_ramp_max=ramp_max,
