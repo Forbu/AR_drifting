@@ -420,21 +420,47 @@ def train_baseline(dataset, hidden_dim=256, n_layers=5,
 # ============================================================================
 
 @torch.no_grad()
-def sample_next_decoupled(model, x_cond, n_ode_steps=50, infer_s=0.0):
+def sample_next_decoupled(model, x_cond, n_ode_steps=50, infer_s=0.0,
+                         ode_s_start=None, ode_s_end=None):
+    """
+    Sample with the conditional decoupled model.
+
+    infer_s:      fixed s across all ODE steps (used if ode_s_start is None)
+    ode_s_start:  s value at t=0 (start of denoising) — overrides infer_s
+    ode_s_end:    s value at t=1 (end of denoising)   — overrides infer_s
+
+    When ode_s_start/ode_s_end are set, s is linearly interpolated across
+    ODE steps. The condition c_s is recomputed each step (since s changes).
+    The model sees the full (t, s(t)) trajectory.
+    """
     B, D = x_cond.shape
     device = x_cond.device
     z = torch.randn(B, D, device=device)
     dt = 1.0 / n_ode_steps
 
     eps_cond_fixed = torch.randn_like(x_cond)
-    s_tensor = torch.full((B, 1), infer_s, device=device)
-    c_s = (1 - s_tensor) * x_cond + s_tensor * eps_cond_fixed
 
-    for i in range(n_ode_steps):
-        t_val = i * dt
-        t = torch.full((B, 1), t_val, device=device)
-        v = model.get_velocity(z, c_s, t, s_tensor)
-        z = z + v * dt
+    # Fixed s mode (original behavior)
+    if ode_s_start is None:
+        s_tensor = torch.full((B, 1), infer_s, device=device)
+        c_s = (1 - s_tensor) * x_cond + s_tensor * eps_cond_fixed
+        for i in range(n_ode_steps):
+            t_val = i * dt
+            t = torch.full((B, 1), t_val, device=device)
+            v = model.get_velocity(z, c_s, t, s_tensor)
+            z = z + v * dt
+    else:
+        # Within-ODE s ramp: s(t) = s_start + (s_end - s_start) * t
+        for i in range(n_ode_steps):
+            t_val = i * dt
+            t = torch.full((B, 1), t_val, device=device)
+            # Linearly interpolate s from start to end as t goes 0→1
+            s_val = ode_s_start + (ode_s_end - ode_s_start) * t_val
+            s_tensor = torch.full((B, 1), s_val, device=device)
+            # Recompute condition at each step since s changes
+            c_s = (1 - s_tensor) * x_cond + s_tensor * eps_cond_fixed
+            v = model.get_velocity(z, c_s, t, s_tensor)
+            z = z + v * dt
 
     return z
 
@@ -504,7 +530,8 @@ def sample_next_baseline(model, x_cond, n_ode_steps=50):
 def autoregressive_rollout(model, start, n_ar_steps=200, n_ode_steps=50,
                            mode='baseline', infer_s=0.0,
                            s_ramp_max=0.0, coupled_noisy=True,
-                           reproject_to_sphere=False):
+                           reproject_to_sphere=False,
+                           ode_s_start=None, ode_s_end=None):
     """
     Autoregressive rollout on the hypersphere.
 
@@ -524,6 +551,13 @@ def autoregressive_rollout(model, start, n_ar_steps=200, n_ode_steps=50,
             else:
                 s = infer_s
             current = sample_next_decoupled(model, current, n_ode_steps, infer_s=s)
+        elif mode == 'decoupled-ode-ramp':
+            # s ramps WITHIN each ODE solve: s(t) = s_start + (s_end-s_start)*t
+            # s_start and s_end come from ode_s_start/ode_s_end params
+            current = sample_next_decoupled(
+                model, current, n_ode_steps,
+                ode_s_start=ode_s_start, ode_s_end=ode_s_end,
+            )
         elif mode == 'decoupled-uncond':
             current = sample_next_decoupled_uncond(model, current, n_ode_steps)
         elif mode == 'coupled':
@@ -890,7 +924,9 @@ def plot_drift_vs_s(all_results, n_ar_steps, save_path):
 # 7. MAIN
 # ============================================================================
 
-def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Path):
+def run_experiment(D, speed, infer_s_values, s_ramp_values,
+                  ode_s_end_values, ode_s_ramp_pairs,
+                  cfg, device, out: Path):
     print(f"\n{'='*70}")
     print(f"  D={D} (sphere S^{D-1})  speed={speed}")
     print(f"{'='*70}")
@@ -955,7 +991,8 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
     results, trajs = {}, {}
 
     def do_rollout(key, model, mode, infer_s=0.0, s_ramp_max=0.0,
-                   coupled_noisy=True, losses=None, reproject=False):
+                   coupled_noisy=True, losses=None, reproject=False,
+                   ode_s_start=None, ode_s_end=None):
         tag = " [reproj]" if reproject else ""
         print(f"  AR rollout [{key}{tag}] ({cfg['n_ar_steps']} steps)...")
         t0r = time.time()
@@ -967,13 +1004,17 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
             s_ramp_max=s_ramp_max,
             coupled_noisy=coupled_noisy,
             reproject_to_sphere=reproject,
+            ode_s_start=ode_s_start, ode_s_end=ode_s_end,
         )
         print(f"    Rollout: {time.time()-t0r:.1f}s")
 
         res = evaluate_rollout(traj)
         res['losses'] = losses
         res['mode'] = mode
-        res['infer_s'] = infer_s if mode in ('decoupled', 'decoupled-uncond') else None
+        res['infer_s'] = infer_s if mode in ('decoupled', 'decoupled-uncond', 'decoupled-ode-ramp') else None
+        if mode == 'decoupled-ode-ramp':
+            res['ode_s_start'] = ode_s_start
+            res['ode_s_end'] = ode_s_end
         print(f"    Final: ||x||_mean={res['norm_mean'][-1]:.4f}  "
               f"norm_error={res['norm_error'][-1]:.4f}  "
               f"angular_disp={res['angular_displacement'][-1]:.3f} rad")
@@ -1010,10 +1051,27 @@ def run_experiment(D, speed, infer_s_values, s_ramp_values, cfg, device, out: Pa
                    model_decoupled, 'decoupled', infer_s=s_val,
                    losses=losses_decoupled)
 
-    # 7) Decoupled conditional with s ramp
+    # 7) Decoupled conditional with s ramp (across AR steps)
     for ramp_max in s_ramp_values:
         do_rollout(f'D={D} spd={speed} decoupled/ramp→{ramp_max}',
                    model_decoupled, 'decoupled', s_ramp_max=ramp_max,
+                   losses=losses_decoupled)
+
+    # 8) Decoupled conditional with WITHIN-ODE s ramp
+    #    Idea: s starts clean (0) at beginning of denoising (t=0),
+    #    ramps up to target noise level by end (t=1).
+    #    Hypothesis: early denoising doesn't need condition noise,
+    #    but final placement benefits from matching the AR drift level.
+    for s_end in ode_s_end_values:
+        do_rollout(f'D={D} spd={speed} ode-ramp/0→{s_end}',
+                   model_decoupled, 'decoupled-ode-ramp',
+                   ode_s_start=0.0, ode_s_end=s_end,
+                   losses=losses_decoupled)
+    # Also try: start slightly noisy, ramp up more
+    for s_start, s_end in ode_s_ramp_pairs:
+        do_rollout(f'D={D} spd={speed} ode-ramp/{s_start}→{s_end}',
+                   model_decoupled, 'decoupled-ode-ramp',
+                   ode_s_start=s_start, ode_s_end=s_end,
                    losses=losses_decoupled)
 
     return results, trajs
@@ -1050,6 +1108,8 @@ def main():
         speeds = args.speeds or [0.2]
         infer_s_values = args.infer_s or [0.0, 0.1]
         s_ramp_values = args.s_ramps or [0.1]
+        ode_s_end_values = [0.1, 0.2, 0.3]
+        ode_s_ramp_pairs = [(0.05, 0.2), (0.1, 0.3)]
     else:
         cfg = dict(
             n_samples=50_000, n_epochs=args.n_epochs or 300, batch_size=512,
@@ -1060,6 +1120,8 @@ def main():
         speeds = args.speeds or [0.1, 0.3]
         infer_s_values = args.infer_s or [0.0, 0.05, 0.1, 0.2]
         s_ramp_values = args.s_ramps or [0.1, 0.3]
+        ode_s_end_values = [0.1, 0.2, 0.3]
+        ode_s_ramp_pairs = [(0.05, 0.2), (0.1, 0.3)]
 
     out = Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1073,7 +1135,9 @@ def main():
     for D in dims:
         for speed in speeds:
             res, trajs = run_experiment(
-                D, speed, infer_s_values, s_ramp_values, cfg, device, out,
+                D, speed, infer_s_values, s_ramp_values,
+                ode_s_end_values, ode_s_ramp_pairs,
+                cfg, device, out,
             )
             all_results.update(res)
             all_traj.update(trajs)
