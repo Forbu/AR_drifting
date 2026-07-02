@@ -227,6 +227,109 @@ def train_bridge(dataset, sigma=0.5, sigma_min=1e-3, hidden_dim=256, n_layers=5,
     return model, losses
 
 
+# ---------------------------------------------------------------------------
+# Bridge + condition-noise augmentation (the hypersphere analog of the
+# blur/noise context augmentation in xpred_blur_v2). The condition x_cond is
+# corrupted as  c_s = (1-s) x_cond + s eps_cond, and the model is told s
+# (decoupled) or not (coupled, where s=t). Combined with the bridge path on
+# the target, this is the closest analog to the weather training setup.
+# ---------------------------------------------------------------------------
+
+def _sample_s_lognormal(B, s_max, device):
+    """LogNormal-skewed condition-noise level s in [0, s_max] (same as v7)."""
+    eps_s = torch.randn(B, 1, device=device)
+    return torch.sigmoid(1.4 + 2.0 * eps_s).clamp(1e-4, 1 - 1e-4) * s_max
+
+
+def train_bridge_decoupled(dataset, sigma=0.5, sigma_min=1e-3, s_max=1.0,
+                           hidden_dim=256, n_layers=5, n_epochs=300,
+                           batch_size=512, lr=1e-3, device='cuda'):
+    """
+    Bridge path on the target + INDEPENDENT condition-noise level s ~ lognormal.
+    The model receives s as an extra input (with_s=True), so it can adapt to
+    the condition quality at inference. This is the analog of the decoupled
+    setup in the original experiment, now layered on top of the bridge path.
+    """
+    D = dataset.D
+    model = FlowMLP(D, hidden_dim, n_layers, with_s=True).to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+
+    losses = []
+    for epoch in range(n_epochs):
+        el, nb = 0.0, 0
+        for x_cond, y in dataset.get_batches(batch_size):
+            B = x_cond.shape[0]
+            t = torch.rand(B, 1, device=device)
+            s = _sample_s_lognormal(B, s_max, device)
+            eps = torch.randn_like(y)
+            eta = torch.randn_like(y)
+            c, _ = bridge_coeffs(t, sigma, sigma_min)
+            c = c.view(B, 1)
+            z_t = (1 - t) * eps + t * y + c * eta
+
+            eps_cond = torch.randn_like(x_cond)
+            c_s = (1 - s) * x_cond + s * eps_cond
+
+            y_hat = model(z_t, c_s, t, s)
+            loss = ((y_hat - y) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            el += loss.item(); nb += 1
+        sched.step()
+        avg = el / nb
+        losses.append(avg)
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            print(f"    [bridge+dec s={sigma} smax={s_max}] "
+                  f"epoch {epoch+1:4d}/{n_epochs}  loss={avg:.6f}")
+    return model, losses
+
+
+def train_bridge_coupled(dataset, sigma=0.5, sigma_min=1e-3,
+                         hidden_dim=256, n_layers=5, n_epochs=300,
+                         batch_size=512, lr=1e-3, device='cuda'):
+    """
+    Bridge path on the target + condition noise TIED to the flow time (s=t).
+    The model does NOT receive s (same arch as clean bridge); it must infer
+    condition quality from c_s itself. At inference the condition is cleaned
+    along the path, mirroring the V5-style coupled sampler.
+    """
+    D = dataset.D
+    model = FlowMLP(D, hidden_dim, n_layers).to(device)
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+
+    losses = []
+    for epoch in range(n_epochs):
+        el, nb = 0.0, 0
+        for x_cond, y in dataset.get_batches(batch_size):
+            B = x_cond.shape[0]
+            t = torch.rand(B, 1, device=device)
+            eps = torch.randn_like(y)
+            eta = torch.randn_like(y)
+            c, _ = bridge_coeffs(t, sigma, sigma_min)
+            c = c.view(B, 1)
+            z_t = (1 - t) * eps + t * y + c * eta
+
+            eps_cond = torch.randn_like(x_cond)
+            c_t = (1 - t) * eps_cond + t * x_cond   # s = t
+
+            y_hat = model(z_t, c_t, t)
+            loss = ((y_hat - y) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            el += loss.item(); nb += 1
+        sched.step()
+        avg = el / nb
+        losses.append(avg)
+        if (epoch + 1) % 50 == 0 or epoch == 0:
+            print(f"    [bridge+coupled s={sigma}] "
+                  f"epoch {epoch+1:4d}/{n_epochs}  loss={avg:.6f}")
+    return model, losses
+
+
 # ============================================================================
 # 5. SAMPLING & AUTOREGRESSIVE ROLLOUT
 # ============================================================================
@@ -273,9 +376,65 @@ def sample_bridge(model, x_cond, sigma, sigma_min, n_ode_steps=50):
 
 
 @torch.no_grad()
+def sample_bridge_decoupled(model, x_cond, sigma, sigma_min, infer_s=0.0,
+                           n_ode_steps=50):
+    """
+    Bridge solver with a decoupled (s-informed) model.
+    infer_s: fixed condition-noise level used during the whole ODE solve.
+      infer_s=0 -> clean condition (best case for well-behaved AR conditions).
+    The condition c_s is corrupted with a FIXED eps_cond draw so it is stable
+    across ODE steps (matches training distribution where eps_cond is one draw).
+    """
+    B, D = x_cond.shape
+    device = x_cond.device
+    eps = torch.randn(B, D, device=device)
+    eps_cond_fixed = torch.randn_like(x_cond)
+    s_t = torch.full((B, 1), infer_s, device=device)
+    c_s = (1 - s_t) * x_cond + s_t * eps_cond_fixed
+    z = eps.clone()
+    dt = 1.0 / n_ode_steps
+    for i in range(n_ode_steps):
+        t_val = i * dt
+        t = torch.full((B, 1), t_val, device=device)
+        x_pred = model(z, c_s, t, s_t)
+        mu_t = (1 - t_val) * eps + t_val * x_pred
+        _, cp_over_c = bridge_coeffs(t_val, sigma, sigma_min)
+        cp_over_c = cp_over_c.item()
+        v = (x_pred - eps) + cp_over_c * (z - mu_t)
+        z = z + v * dt
+    return z
+
+
+@torch.no_grad()
+def sample_bridge_coupled(model, x_cond, sigma, sigma_min, n_ode_steps=50):
+    """
+    Bridge solver with a coupled (s=t) model: condition is cleaned along the
+    path, c_t = (1-t) eps_cond + t x_cond, mirroring the V5-style sampler.
+    eps_cond is fixed across steps.
+    """
+    B, D = x_cond.shape
+    device = x_cond.device
+    eps = torch.randn(B, D, device=device)
+    eps_cond_fixed = torch.randn_like(x_cond)
+    z = eps.clone()
+    dt = 1.0 / n_ode_steps
+    for i in range(n_ode_steps):
+        t_val = i * dt
+        t = torch.full((B, 1), t_val, device=device)
+        c_t = (1 - t_val) * eps_cond_fixed + t_val * x_cond
+        x_pred = model(z, c_t, t)
+        mu_t = (1 - t_val) * eps + t_val * x_pred
+        _, cp_over_c = bridge_coeffs(t_val, sigma, sigma_min)
+        cp_over_c = cp_over_c.item()
+        v = (x_pred - eps) + cp_over_c * (z - mu_t)
+        z = z + v * dt
+    return z
+
+
+@torch.no_grad()
 def autoregressive_rollout(model, start, n_ar_steps=200, n_ode_steps=50,
                            mode='rectified', sigma=0.5, sigma_min=1e-3,
-                           reproject_to_sphere=False):
+                           infer_s=0.0, reproject_to_sphere=False):
     traj = [start.cpu()]
     current = start
     for _ in range(n_ar_steps):
@@ -283,6 +442,11 @@ def autoregressive_rollout(model, start, n_ar_steps=200, n_ode_steps=50,
             current = sample_rectified(model, current, n_ode_steps)
         elif mode == 'bridge':
             current = sample_bridge(model, current, sigma, sigma_min, n_ode_steps)
+        elif mode == 'bridge_decoupled':
+            current = sample_bridge_decoupled(model, current, sigma, sigma_min,
+                                              infer_s, n_ode_steps)
+        elif mode == 'bridge_coupled':
+            current = sample_bridge_coupled(model, current, sigma, sigma_min, n_ode_steps)
         else:
             raise ValueError(mode)
         if reproject_to_sphere:
@@ -483,6 +647,28 @@ def run_experiment(D, speed, sigmas, cfg, device, out):
         bridge_models[s] = (m, l)
         print(f"    done {time.time()-t0:.1f}s")
 
+    # --- Bridge + condition-noise augmentation models (one per sigma) ---
+    # Pick the middle sigma for the aug comparison to limit compute.
+    aug_sigma = sigmas[len(sigmas) // 2] if sigmas else 0.5
+    s_max = cfg.get('s_max', 1.0)
+    print(f"\n  Training [bridge+decoupled sigma={aug_sigma} s_max={s_max}]...")
+    t0 = time.time()
+    m_bdec, l_bdec = train_bridge_decoupled(
+        dataset, sigma=aug_sigma, sigma_min=1e-3, s_max=s_max,
+        hidden_dim=cfg['hidden_dim'], n_layers=cfg['n_layers'],
+        n_epochs=cfg['n_epochs'], batch_size=cfg['batch_size'], lr=1e-3, device=device)
+    m_bdec.eval()
+    print(f"    done {time.time()-t0:.1f}s")
+
+    print(f"\n  Training [bridge+coupled sigma={aug_sigma}]...")
+    t0 = time.time()
+    m_bcou, l_bcou = train_bridge_coupled(
+        dataset, sigma=aug_sigma, sigma_min=1e-3,
+        hidden_dim=cfg['hidden_dim'], n_layers=cfg['n_layers'],
+        n_epochs=cfg['n_epochs'], batch_size=cfg['batch_size'], lr=1e-3, device=device)
+    m_bcou.eval()
+    print(f"    done {time.time()-t0:.1f}s")
+
     # --- Starting points ---
     rng = np.random.RandomState(1042)
     start_np = rng.randn(cfg['n_eval'], D).astype(np.float32)
@@ -491,7 +677,8 @@ def run_experiment(D, speed, sigmas, cfg, device, out):
 
     results, trajs = {}, {}
 
-    def do_rollout(key, model, mode, losses=None, sigma=None, reproject=False):
+    def do_rollout(key, model, mode, losses=None, sigma=None, infer_s=0.0,
+                   reproject=False):
         tag = " [reproj]" if reproject else ""
         print(f"  AR rollout [{key}{tag}] ({cfg['n_ar_steps']} steps)...")
         t0 = time.time()
@@ -499,7 +686,8 @@ def run_experiment(D, speed, sigmas, cfg, device, out):
             model, start, n_ar_steps=cfg['n_ar_steps'],
             n_ode_steps=cfg['n_ode_steps'], mode=mode,
             sigma=sigma if sigma is not None else 0.5,
-            sigma_min=1e-3, reproject_to_sphere=reproject,
+            sigma_min=1e-3, infer_s=infer_s,
+            reproject_to_sphere=reproject,
         )
         print(f"    {time.time()-t0:.1f}s")
         res = evaluate_rollout(traj)
@@ -507,6 +695,8 @@ def run_experiment(D, speed, sigmas, cfg, device, out):
         res['mode'] = mode
         if sigma is not None:
             res['sigma'] = sigma
+        if mode in ('bridge_decoupled',):
+            res['infer_s'] = infer_s
         print(f"    final ||x||={res['norm_mean'][-1]:.4f}  "
               f"|err|={res['norm_error'][-1]:.4f}  "
               f"angle={res['angular_displacement'][-1]:.3f}")
@@ -529,6 +719,19 @@ def run_experiment(D, speed, sigmas, cfg, device, out):
         m_b, _ = bridge_models[s0]
         do_rollout(f'D={D} spd={speed} bridge/s={s0}+reproj', m_b, 'bridge',
                    sigma=s0, reproject=True)
+    # 5) Bridge + condition-noise augmentation
+    #    Decoupled: sweep inference condition-noise s. infer_s=0 = clean
+    #    condition (ideal for AR), higher s injects diversity / robustness.
+    do_rollout(f'D={D} spd={speed} bridge+dec/s={aug_sigma} inf_s=0',
+               m_bdec, 'bridge_decoupled', losses=l_bdec, sigma=aug_sigma,
+               infer_s=0.0)
+    for inf_s in cfg.get('infer_s_values', [0.1, 0.3]):
+        do_rollout(f'D={D} spd={speed} bridge+dec/s={aug_sigma} inf_s={inf_s}',
+                   m_bdec, 'bridge_decoupled', losses=l_bdec, sigma=aug_sigma,
+                   infer_s=inf_s)
+    #    Coupled: condition cleaned along the path (s=t), no infer knob.
+    do_rollout(f'D={D} spd={speed} bridge+cou/s={aug_sigma}',
+               m_bcou, 'bridge_coupled', losses=l_bcou, sigma=aug_sigma)
 
     return results, trajs
 
@@ -545,6 +748,10 @@ def main():
     parser.add_argument('--n_ode_steps', type=int, default=None)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--n_layers', type=int, default=5)
+    parser.add_argument('--s_max', type=float, default=1.0,
+                        help='max condition-noise level for aug training')
+    parser.add_argument('--infer_s', type=float, nargs='+', default=None,
+                        help='inference condition-noise levels for decoupled aug')
     parser.add_argument('--outdir', type=str, default='./results_hypersphere_bridge')
     args = parser.parse_args()
 
@@ -556,7 +763,9 @@ def main():
     if args.quick:
         cfg = dict(n_samples=10_000, n_epochs=80, batch_size=512,
                    n_ar_steps=50, n_ode_steps=20, n_eval=128,
-                   hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+                   hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                   s_max=args.s_max,
+                   infer_s_values=args.infer_s or [0.1, 0.3])
         dims = args.dims or [16]
         speeds = args.speeds or [0.2]
         sigmas = args.sigmas or [0.3, 0.5]
@@ -564,7 +773,9 @@ def main():
         cfg = dict(n_samples=50_000, n_epochs=args.n_epochs or 300, batch_size=512,
                    n_ar_steps=args.n_ar_steps or 200,
                    n_ode_steps=args.n_ode_steps or 50, n_eval=256,
-                   hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+                   hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                   s_max=args.s_max,
+                   infer_s_values=args.infer_s or [0.1, 0.3, 0.5])
         dims = args.dims or [16, 32, 64]
         speeds = args.speeds or [0.1, 0.3]
         sigmas = args.sigmas or [0.3, 0.5, 1.0]
