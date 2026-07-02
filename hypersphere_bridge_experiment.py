@@ -351,12 +351,26 @@ def sample_rectified(model, x_cond, n_ode_steps=50):
 
 
 @torch.no_grad()
-def sample_bridge(model, x_cond, sigma, sigma_min, n_ode_steps=50):
+def sample_bridge(model, x_cond, sigma, sigma_min, n_ode_steps=50,
+                  integrator='exact'):
     """
-    Forward Euler 0->1 with the bridge velocity:
-        v = (x_pred - eps) + (c'/c)(z - mu_t),  mu_t = (1-t) eps + t x_pred
-    eps is the FIXED noise source sampled at t=0 and reused across steps.
-    At the final step z lands on x_pred (endpoint variance ~ sigma_min^2).
+    Bridge solver. Convention: t=0 -> noise (eps), t=1 -> data.
+
+    Two integrators:
+      - 'exact': closed-form step (recommended). Treating the model prediction
+        y as frozen over [t, t+dt], the bridge ODE integrates to
+            z(t+dt) = mu_t(t+dt) + (z(t) - mu_t(t)) * c(t+dt)/c(t)
+        because dw/ds = (c'/c) w with w = z - mu_t. This absorbs the stiff
+        mean-reversion coefficient (c'/c blows up ~1/sigma_min^2 near the
+        endpoints) into the O(1) ratio c(t+dt)/c(t), so it is stable for any
+        sigma_min and lands exactly on y at t=1. Correct even at high D where
+        naive Euler diverges.
+      - 'euler': the original forward-Euler step
+            v = (y-eps) + (c'/c)(z - mu_t),  z += v dt
+        kept for comparison/diagnosis. Diverges at high D / small sigma_min
+        because the (c'/c)(z-mu_t) term amplifies per-step error by ~1/sigma_min^2.
+
+    eps is the FIXED noise source sampled once and reused across steps.
     """
     B, D = x_cond.shape
     device = x_cond.device
@@ -365,19 +379,37 @@ def sample_bridge(model, x_cond, sigma, sigma_min, n_ode_steps=50):
     dt = 1.0 / n_ode_steps
     for i in range(n_ode_steps):
         t_val = i * dt
+        t_next = t_val + dt
         t = torch.full((B, 1), t_val, device=device)
         x_pred = model(z, x_cond, t)
-        mu_t = (1 - t_val) * eps + t_val * x_pred
+        z = _bridge_step(z, eps, x_pred, t_val, t_next, sigma, sigma_min, integrator)
+    return z
+
+
+def _bridge_step(z, eps, x_pred, t_val, t_next, sigma, sigma_min, integrator):
+    """One bridge ODE step over [t_val, t_next] with x_pred frozen.
+
+    'exact'  : closed-form  z(t_next) = mu_next + (z-mu_t) * c_next/c_t
+    'euler'  : forward Euler with the stiff (c'/c)(z-mu_t) term.
+    Shared by sample_bridge / sample_bridge_decoupled / sample_bridge_coupled.
+    """
+    mu_t = (1 - t_val) * eps + t_val * x_pred
+    if integrator == 'exact':
+        c_t, _ = bridge_coeffs(t_val, sigma, sigma_min)
+        c_next, _ = bridge_coeffs(t_next, sigma, sigma_min)
+        ratio = (c_next / c_t).item()
+        mu_next = (1 - t_next) * eps + t_next * x_pred
+        return mu_next + (z - mu_t) * ratio
+    else:  # euler
         _, cp_over_c = bridge_coeffs(t_val, sigma, sigma_min)
         cp_over_c = cp_over_c.item()
         v = (x_pred - eps) + cp_over_c * (z - mu_t)
-        z = z + v * dt
-    return z
+        return z + v * (t_next - t_val)
 
 
 @torch.no_grad()
 def sample_bridge_decoupled(model, x_cond, sigma, sigma_min, infer_s=0.0,
-                           n_ode_steps=50):
+                           n_ode_steps=50, integrator='exact'):
     """
     Bridge solver with a decoupled (s-informed) model.
     infer_s: fixed condition-noise level used during the whole ODE solve.
@@ -395,18 +427,16 @@ def sample_bridge_decoupled(model, x_cond, sigma, sigma_min, infer_s=0.0,
     dt = 1.0 / n_ode_steps
     for i in range(n_ode_steps):
         t_val = i * dt
+        t_next = t_val + dt
         t = torch.full((B, 1), t_val, device=device)
         x_pred = model(z, c_s, t, s_t)
-        mu_t = (1 - t_val) * eps + t_val * x_pred
-        _, cp_over_c = bridge_coeffs(t_val, sigma, sigma_min)
-        cp_over_c = cp_over_c.item()
-        v = (x_pred - eps) + cp_over_c * (z - mu_t)
-        z = z + v * dt
+        z = _bridge_step(z, eps, x_pred, t_val, t_next, sigma, sigma_min, integrator)
     return z
 
 
 @torch.no_grad()
-def sample_bridge_coupled(model, x_cond, sigma, sigma_min, n_ode_steps=50):
+def sample_bridge_coupled(model, x_cond, sigma, sigma_min, n_ode_steps=50,
+                          integrator='exact'):
     """
     Bridge solver with a coupled (s=t) model: condition is cleaned along the
     path, c_t = (1-t) eps_cond + t x_cond, mirroring the V5-style sampler.
@@ -420,14 +450,11 @@ def sample_bridge_coupled(model, x_cond, sigma, sigma_min, n_ode_steps=50):
     dt = 1.0 / n_ode_steps
     for i in range(n_ode_steps):
         t_val = i * dt
+        t_next = t_val + dt
         t = torch.full((B, 1), t_val, device=device)
         c_t = (1 - t_val) * eps_cond_fixed + t_val * x_cond
         x_pred = model(z, c_t, t)
-        mu_t = (1 - t_val) * eps + t_val * x_pred
-        _, cp_over_c = bridge_coeffs(t_val, sigma, sigma_min)
-        cp_over_c = cp_over_c.item()
-        v = (x_pred - eps) + cp_over_c * (z - mu_t)
-        z = z + v * dt
+        z = _bridge_step(z, eps, x_pred, t_val, t_next, sigma, sigma_min, integrator)
     return z
 
 
