@@ -233,6 +233,7 @@ def train_bridge(dataset, sigma=0.5, sigma_min=1e-3, hidden_dim=256, n_layers=5,
             z_t = mu_t + c * eta
             y_hat = model(z_t, x_cond, t)
             w = 1.0 / (c ** 2)   # inverse conditional variance; (B,1)
+            w = w.clamp(1.0, 200.0)   # cap the 1/sigma_min^2 endpoint blow-up
             loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -293,6 +294,7 @@ def train_bridge_decoupled(dataset, sigma=0.5, sigma_min=1e-3, s_max=1.0,
 
             y_hat = model(z_t, c_s, t, s)
             w = 1.0 / (c ** 2)
+            w = w.clamp(1.0, 200.0)
             loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -339,6 +341,7 @@ def train_bridge_coupled(dataset, sigma=0.5, sigma_min=1e-3,
 
             y_hat = model(z_t, c_t, t)
             w = 1.0 / (c ** 2)
+            w = w.clamp(1.0, 200.0)
             loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
