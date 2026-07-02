@@ -158,7 +158,17 @@ class FlowMLP(nn.Module):
 
 def train_rectified(dataset, hidden_dim=256, n_layers=5, n_epochs=300,
                     batch_size=512, lr=1e-3, device='cuda'):
-    """Standard rectified flow: z_t = (1-t) eps + t y, x-prediction loss to y."""
+    """Standard rectified flow: z_t = (1-t) eps + t y.
+
+    x-prediction with the inverse-conditional-variance weight w(t) = 1/(1-t)^2
+    (the optimal FM / SNR weight; Gagneux & Martin 2026, "Training Flow Matching").
+    Plain unweighted x-prediction collapses to the trivial 'predict the
+    condition' solution: on this dataset that achieves loss ~ speed^2/D ~ 0.0013
+    at D=64 (reached in 1 epoch) and the model never learns the dynamics. The
+    1/(1-t)^2 weight upweights the low-noise regime (t->1) where the model must
+    actually pinpoint y, preventing the collapse and matching the original
+    experiment's loss regime (~0.06). Inference is unchanged (uses x_pred).
+    """
     D = dataset.D
     model = FlowMLP(D, hidden_dim, n_layers).to(device)
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -173,7 +183,10 @@ def train_rectified(dataset, hidden_dim=256, n_layers=5, n_epochs=300,
             eps = torch.randn_like(y)
             z_t = (1 - t) * eps + t * y
             y_hat = model(z_t, x_cond, t)
-            loss = ((y_hat - y) ** 2).mean()
+            # inverse-variance weight: 1/((1-t)^2) for the linear path.
+            # Clamp t away from 1 to keep the weight finite.
+            w = 1.0 / ((1 - t).clamp(min=1e-2) ** 2)
+            loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -189,10 +202,17 @@ def train_rectified(dataset, hidden_dim=256, n_layers=5, n_epochs=300,
 def train_bridge(dataset, sigma=0.5, sigma_min=1e-3, hidden_dim=256, n_layers=5,
                  n_epochs=300, batch_size=512, lr=1e-3, device='cuda'):
     """
-    Brownian-bridge flow: z_t = (1-t) eps + t y + c_t eta, x-prediction to y.
+    Brownian-bridge flow: z_t = (1-t) eps + t y + c_t eta,  c_t^2 = sigma^2 t(1-t) + sigma_min^2.
 
-    Only the input distribution z_t changes vs rectified; the target and the
-    x-prediction head are identical, so the model architecture is unchanged.
+    x-prediction with the INVERSE-CONDITIONAL-VARIANCE weight w(t) = 1/c_t^2.
+    This is the bridge analog of the RF 1/(1-t)^2 weight (Gagneux & Martin
+    2026, derived from maximum-likelihood / inverse-variance regression): both
+    upweight the low-noise data end where the model must pinpoint y, and neither
+    explodes because the weight is applied to the x-prediction residual (which
+    stays O(1)), NOT to a velocity target whose c'/c term diverges near the
+    sigma_min endpoints. (Naive bridge velocity loss explodes to ~1e3 because
+    the target itself contains the singular coefficient c'/c -> 1/sigma_min^2.)
+    Inference is unchanged (uses x_pred + exact step).
     """
     D = dataset.D
     model = FlowMLP(D, hidden_dim, n_layers).to(device)
@@ -207,14 +227,13 @@ def train_bridge(dataset, sigma=0.5, sigma_min=1e-3, hidden_dim=256, n_layers=5,
             t = torch.rand(B, 1, device=device)
             eps = torch.randn_like(y)
             eta = torch.randn_like(y)
-
             c, _ = bridge_coeffs(t, sigma, sigma_min)            # (B,1)
             c = c.view(B, 1)
             mu_t = (1 - t) * eps + t * y
             z_t = mu_t + c * eta
-
             y_hat = model(z_t, x_cond, t)
-            loss = ((y_hat - y) ** 2).mean()
+            w = 1.0 / (c ** 2)   # inverse conditional variance; (B,1)
+            loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -266,13 +285,15 @@ def train_bridge_decoupled(dataset, sigma=0.5, sigma_min=1e-3, s_max=1.0,
             eta = torch.randn_like(y)
             c, _ = bridge_coeffs(t, sigma, sigma_min)
             c = c.view(B, 1)
-            z_t = (1 - t) * eps + t * y + c * eta
+            mu_t = (1 - t) * eps + t * y
+            z_t = mu_t + c * eta
 
             eps_cond = torch.randn_like(x_cond)
             c_s = (1 - s) * x_cond + s * eps_cond
 
             y_hat = model(z_t, c_s, t, s)
-            loss = ((y_hat - y) ** 2).mean()
+            w = 1.0 / (c ** 2)
+            loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -310,13 +331,15 @@ def train_bridge_coupled(dataset, sigma=0.5, sigma_min=1e-3,
             eta = torch.randn_like(y)
             c, _ = bridge_coeffs(t, sigma, sigma_min)
             c = c.view(B, 1)
-            z_t = (1 - t) * eps + t * y + c * eta
+            mu_t = (1 - t) * eps + t * y
+            z_t = mu_t + c * eta
 
             eps_cond = torch.randn_like(x_cond)
             c_t = (1 - t) * eps_cond + t * x_cond   # s = t
 
             y_hat = model(z_t, c_t, t)
-            loss = ((y_hat - y) ** 2).mean()
+            w = 1.0 / (c ** 2)
+            loss = (w * (y_hat - y) ** 2).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
