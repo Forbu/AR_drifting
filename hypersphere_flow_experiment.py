@@ -1112,7 +1112,7 @@ def main():
         ode_s_ramp_pairs = [(0.05, 0.2), (0.1, 0.3)]
     else:
         cfg = dict(
-            n_samples=50_000, n_epochs=args.n_epochs or 300, batch_size=512,
+            n_samples=300_000, n_epochs=args.n_epochs or 400, batch_size=2048,
             n_ar_steps=args.n_ar_steps or 200, n_ode_steps=50, n_eval=256,
             hidden_dim=args.hidden_dim, n_layers=args.n_layers,
         )
