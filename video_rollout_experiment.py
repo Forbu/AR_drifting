@@ -111,6 +111,9 @@ VAE_LATENT      = _env("VAE_LATENT", 32, int)
 VAE_EPOCHS      = _env("VAE_EPOCHS", 12, int)
 VAE_NOISE       = _env("VAE_NOISE", 0.5, float)   # latent noise magnitude (in latent-std units)
 VAE_BETA        = _env("VAE_BETA", 1e-3, float)   # KL weight (small -> sharp recon; ~0 = autoencoder)
+# Classifier-free guidance on the context (overlay; applies to any technique)
+UNCOND_PROB     = _env("UNCOND_PROB", 0.0, float)   # train: prob of dropping context (unconditional)
+GUIDANCE        = _env("GUIDANCE", 1.0, float)     # infer: v = v_uncond + GUIDANCE*(v_cond - v_uncond)
 _VAE = None   # global trained corruptor (vae, latent_std), set in main
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 
@@ -466,7 +469,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
             if mask.any():
                 sur_ctx = torch.stack([extra[mask], ctx[mask, 0]], dim=1)  # Bm,K,C,H,W
                 with torch.no_grad():
-                    pred = sample_step(model, sur_ctx, ODE_STEPS)
+                    pred = sample_step(model, sur_ctx, ODE_STEPS, guidance=1.0)
                 out[mask, 1] = pred
         blurred = _blur2d(out, BLUR_SIGMA * 0.4)
         if TECHNIQUE in ("selffeed_m", "selffeed_ms"):
@@ -526,6 +529,12 @@ def train(data):
         z_t = (1 - t.view(-1, 1, 1, 1)) * eps + t.view(-1, 1, 1, 1) * tgt
         v_target = tgt - eps
         ctx_aug = augment_context(ctx, model=model, extra=extra, training=True)
+        # classifier-free guidance: per-sample context dropout (train unconditional path)
+        if UNCOND_PROB > 0:
+            drop = torch.rand(ctx_aug.shape[0], device=ctx_aug.device) < UNCOND_PROB
+            if drop.any():
+                ctx_aug = ctx_aug.clone()
+                ctx_aug[drop] = 0.0
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             v_pred = model.get_velocity(z_t, ctx_aug, t)
             # inverse-conditional-variance weight 1/(1-t)^2 clamped (RF x-pred)
@@ -537,7 +546,7 @@ def train(data):
         # training the model to stay consistent when its own output is fed back.
         if TECHNIQUE == "selffeed_ms" and MS_PROB > 0 and rng.rand() < MS_PROB:
             with torch.no_grad():
-                pred1 = sample_step(model, ctx, ODE_STEPS)  # model's pred of tgt from CLEAN ctx (matches inference)
+                pred1 = sample_step(model, ctx, ODE_STEPS, guidance=1.0)  # model's pred of tgt from CLEAN ctx (matches inference)
             ctx2 = torch.stack([ctx[:, 1], pred1], dim=1)   # B,K,C,H,W
             ctx2_aug = augment_context(ctx2, model=model, extra=extra, training=True)
             t2 = torch.rand(BATCH, device=DEVICE)
@@ -564,8 +573,10 @@ def train(data):
 # 5. SAMPLING & ROLLOUT
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def sample_step(model, ctx, n_ode):
-    """Sample one frame (B,C,H,W) from context ctx (B,K,C,H,W)."""
+def sample_step(model, ctx, n_ode, guidance=None):
+    """Sample one frame (B,C,H,W) from context ctx (B,K,C,H,W).
+    guidance=None -> use global GUIDANCE (inference); pass 1.0 to disable (training)."""
+    g = GUIDANCE if guidance is None else guidance
     B = ctx.shape[0]
     z = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
     dt = 1.0 / n_ode
@@ -574,6 +585,9 @@ def sample_step(model, ctx, n_ode):
         for i in range(n_ode):
             t = torch.full((B,), i * dt, device=DEVICE)
             v = model.get_velocity(z, ctx_aug, t)
+            if g != 1.0:
+                v_u = model.get_velocity(z, torch.zeros_like(ctx_aug), t)
+                v = v_u + g * (v - v_u)
             z = z + v * dt
     return z.float()
 
