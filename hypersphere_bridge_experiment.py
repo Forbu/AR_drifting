@@ -712,7 +712,7 @@ def main():
         speeds = args.speeds or [0.2]
         sigmas = args.sigmas or [0.3, 0.5]
     else:
-        cfg = dict(n_samples=50_000, n_epochs=args.n_epochs or 300, batch_size=512,
+        cfg = dict(n_samples=300_000, n_epochs=args.n_epochs or 400, batch_size=2048,
                    n_ar_steps=args.n_ar_steps or 200,
                    n_ode_steps=args.n_ode_steps or 50, n_eval=256,
                    hidden_dim=args.hidden_dim, n_layers=args.n_layers)
