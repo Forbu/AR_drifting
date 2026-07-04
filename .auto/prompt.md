@@ -76,20 +76,28 @@ Full results + mechanism in `FINDINGS_VIDEO.md`. Summary:
 | selffeed2 (2-step) | 988 | 0.77 | 0.18 | deeper compounding doesn't help |
 | **selffeed_m** (champion) | **747** | **0.90** | **0.07** | stable + sharp |
 
-**Winner: scheduled sampling (selffeed) + on-manifold amplitude jitter.**
-Generalizes to C=2 / different seed (3x pixnoise, sharpness 0.88).
+**Winner: scheduled sampling (selffeed_m) + multi-step rollout loss (selffeed_ms).**
+Generalizes to C=2 / different seed (selffeed_m: 3x pixnoise, sharpness 0.88).
 
 **DETERMINISTIC REGIME (2026-07-04):** switched to `torch.use_deterministic_algorithms`
 + `CUBLAS_WORKSPACE_CONFIG` + `cudnn.deterministic`. Prior runs had ~±50% run-to-run
 variance from GPU non-determinism × chaotic-rollout amplification (a false "285" ED
-outlier appeared and did NOT reproduce). Now single runs reproduce exactly (verified:
-selffeed_m → 912.186462 three times). Reproducible numbers: pixnoise=6746,
-selffeed_m=912 (7.4× better), selffeed_m BLUR_SIGMA=1.5=1015 (worse than 1.0 — the
-blur sweep is now resolved: 1.0 wins). Cost: ~20% slower (170s→215s).
+outlier appeared and did NOT reproduce). Now single runs reproduce exactly.
 
-Key insight: rollout instability = exposure bias. Pixel noise is implausible
-for image data (breaks structure); the BEST degraded context is the model's own
-predictions (scheduled sampling) + mild blur (σ≈0.4) to smooth them.
+Reproducible-regime numbers (lower=better):
+| Technique | rollout_ed | sharp | mass_drift | note |
+|---|---|---|---|---|
+| pixnoise | 6746 | 0.22 | 0.64 | fails |
+| selffeed_m | 912 | 0.87 | 0.08 | scheduled sampling + amplitude jitter |
+| **selffeed_ms (champion)** | **690** | 0.91 | 0.02 | + 2-step rollout loss (MS_PROB=0.3) |
+
+selffeed_ms improves on selffeed_m by 24% (912->690) and is 9.8x better than pixnoise.
+MS_PROB sweep: 0.15->725, 0.3->690 (optimum), 0.5->1023.
+
+Key insight: rollout instability = exposure bias. Selffeed augments the INPUT
+context (feeds model's own predictions); the multi-step rollout loss adds a LOSS
+on the model's 2-step compounded output, directly closing the compounding gap.
+Both are needed. Pixel noise fails (breaks image structure).
 
 ## Key Insight from Prior Work (FINDINGS.md)
 Stability comes from the model **seeing degraded conditions during training** so it

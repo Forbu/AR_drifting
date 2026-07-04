@@ -25,7 +25,12 @@ sharpness_ratio ~1.0 and mass_drift ~0 are ideal).
   mass_drift 0.14.
 - **Adding on-manifold amplitude jitter ("selffeed_m") keeps stability and
   sharpens frames**: sharpness 0.78 → **0.90**, mass_drift 0.14 → **0.07**, at
-  equal rollout_ed. **Recommended config.**
+  equal rollout_ed.
+- **Adding a 2-step rollout loss ("selffeed_ms") is the new champion** (deterministic
+  regime): ED 912 → **690** (24% better than selffeed_m, 9.8× vs pixnoise),
+  ed_late 1240 → 710 (stable end-to-end), mass_drift 0.08 → 0.02. The multi-step
+  loss adds a *loss* on the model's own 2-step compounded output, closing the
+  compounding gap that input-only selffeed misses. Reproducible (deterministic).
 - **Reproduces the user's real-world finding**: plain Gaussian pixel/voxel noise
   on the context **fails** on structured image data (sharpness 0.18 — catastrophic
   blur, mass_drift 0.65) — and is in fact **WORSE than no augmentation at all**
@@ -102,20 +107,29 @@ not synthetic noise.
 
 ## Actionable takeaways for the weather model
 
-1. **Adopt scheduled sampling ("teacher forcing → self-feeding") in the RF
-   trainer.** During training, with prob ~0.3 (constant from step 0), replace one
-   context frame with the model's own 1-step forecast (detached, mild blur
-   σ≈0.4 px). This is the single highest-value change for AR-rollout stability on
-   image data. Do NOT ramp it (constant is better than curriculum).
-2. **Keep a SMALL context blur** alongside it (smooths model-prediction noise into
-   plausible contexts). Do **not** use strong blur alone (artifacts + loss).
-3. **Add on-manifold amplitude/scale jitter** to context augmentation to keep
-   outputs sharp (selffeed_m): sharpness 0.78→0.90, mass_drift halved.
-4. **Do NOT use pixel/voxel noise augmentation** for image context — it
-   catastrophically blurs rollouts (sharpness 0.18), regardless of schedule.
-5. **Probability ~0.3 is the sweet spot**; higher (0.5) causes late divergence.
-6. **Multi-step compounding is not needed** at this cadence; single-step suffices
-   (cheaper). Revisit for very long rollouts.
+1. **Adopt scheduled sampling ("selffeed") AND a multi-step rollout loss** in the
+   RF trainer. This is the combined recipe (`selffeed_ms`) that wins:
+   - With prob ~0.3 (constant from step 0), replace one context frame with the
+     model's own 1-step forecast (detached) + mild blur σ≈0.4 px + small
+     amplitude jitter. (Augments the *input* context.)
+   - With prob ~0.3, add a loss term on predicting frame t+1 from a context that
+     contains the model's own prediction of frame t (detached). (Adds a *loss* on
+     the 2-step compounded output.) This closed the remaining late-rollout drift
+     that input-only selffeed missed: ED 912→690, ed_late 1240→710, mass_drift
+     0.08→0.02, reproducibly.
+2. **Keep a SMALL context blur** (σ≈0.4 px) on the self-fed frames; do **not**
+   use strong blur alone (artifacts + dynamics loss). Optimal internal blur ≈0.4.
+3. **Do NOT use pixel/voxel noise augmentation** — it is *worse than no aug* on
+   slow/weather-like image data (sharpness 0.22, catastrophically blurry).
+4. **Probabilities ~0.3** for both self-feed and the multi-step loss; higher
+   (0.5) causes late divergence / dynamics loss. Lower (0.15) gives slightly
+   sharper frames but worse rollout ED.
+5. **Multi-step depth**: 2-step loss suffices at this cadence (single-step
+   selffeed alone is 912; +2-step loss → 690). A 3-step loss is untested but
+   likely diminishing returns for the cost.
+6. **Use deterministic eval** when tuning: GPU non-determinism × chaotic rollout
+   gave ~±50% variance and a false outlier; `torch.use_deterministic_algorithms`
+   + `CUBLAS_WORKSPACE_CONFIG` makes single runs reproducible (~20% slower).
 
 ---
 

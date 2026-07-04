@@ -3,10 +3,13 @@
 ## High-value, not yet tried on this benchmark
 - **Selffeed with gradient** (truncated BPTT through the surrogate step) instead of
   detach: lets the model learn to *correct* its errors, not just tolerate them.
-  More expensive; may help sharpness. UNTESTED.
-- **Consistency-loss / self-distillation**: add a loss term that pulls the
-  one-step sample toward a multi-step (ODE-solved) sample — enforces rollout
-  consistency directly. UNTESTED.
+  More expensive; may help sharpness. UNTESTED. (Note: reasoned that detach is
+  correct for the input-context surrogate, but BPTT through the multi-step LOSS
+  is different and untested.)
+- ~~Consistency-loss / self-distillation~~: DONE as selffeed_ms (2-step rollout
+  loss) — REAL WIN, new champion (ED 912->690, reproducible).
+- **3-step rollout loss** (deeper than selffeed_ms's 2-step): untested, likely
+  diminishing returns.
 - **Restart / renoise during ODE sampling** (stochastic sampler) at each AR step —
   sampling-side mechanism, orthogonal to training aug. UNTESTED.
 - **Classifier-free guidance** on the context (drop context w.p. during training,
