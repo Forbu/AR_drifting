@@ -37,6 +37,11 @@ sharpness_ratio ~1.0 and mass_drift ~0 are ideal).
   dense-data regime (multi-blob 2691 → 1822, near no-aug 1563). Adaptively
   self-feeds when predictions are good (sparse), skips when poor (dense). No
   sparsity detector needed. Gate sweep: 0.25→668, **0.5→654 (optimum)**, 0.75→699.
+  **Budget caveat:** gating helps at low budget (2000: 654 vs ungated 690) but
+  *hurts* at high budget (3500: gated 330 vs ungated **156**) — once well-trained
+  all surrogates are decent, so the gate discards useful exposure. Use gated when
+  budget-limited, ungated when training to convergence. Absolute (err/var) gating
+  was tried and is worse (keeps a biased subset).
 - **Reproduces the user's real-world finding**: plain Gaussian pixel/voxel noise
   on the context **fails** on structured image data (sharpness 0.18 — catastrophic
   blur, mass_drift 0.65) — and is in fact **WORSE than no augmentation at all**
