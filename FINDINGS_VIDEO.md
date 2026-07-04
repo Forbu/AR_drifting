@@ -158,12 +158,30 @@ Results (deterministic, TRAIN_STEPS=2000):
 | **VAE (β=1e-3) latent noise** | **12712** | **0.22** | **FAILS — worse than pixnoise!** |
 | manifold_noise (blur+jitter) | 2142 | 1.26 | artifacty |
 | AE (β≈1e-5) latent noise | 2113 | 0.77 | sharp AE works |
-| AE latent-interp + blur | 1268 | 1.18 | two-blob blends, artifacty |
-| **AE latent-noise + mild blur (σ_n=0.2)** | **1186** | **0.93** | **best no-self-feed (5.7× pixnoise)** |
+| AE latent-interp (random frame) + blur | 1268 | 1.18 | two-blob blends, artifacty |
+| AE latent-interp (TEMPORAL neighbor) + blur | 1305 | **1.03** | clean position shift; best per-frame quality |
+| **AE latent-noise + mild blur (σ_n=0.2)** | **1186** | **0.93** | **best no-self-feed on rollout-ED (5.7× pixnoise)** |
 | selffeed_ms (needs self-outputs) | 690 | 0.91 | champion |
 
 VAE_NOISE sweep for the winner: 0.1→1600, **0.2→1186 (optimum)**, 0.3→2112
 (sharp valley). Adding amplitude jitter on top *hurt* (over-corruption, 2077).
+
+**Two strong no-self-feed options, different strengths:** `vae_noise_blur` wins on
+rollout-ED (1186); `vae_interptemp_blur` wins on per-frame quality (sharpness 1.03,
+mass_drift 0.006 — best of any technique). For weather (blurry = failure), the
+temporal variant's sharpness may be preferable despite slightly higher ED.
+
+**Why the VAE approach plateaus (~1186) and selffeed keeps improving:** selffeed is
+a **closed loop** — the corruption *is* the model's own predictions, so as the model
+improves, the corruption tracks its actual (shrinking) error distribution →
+compounding gains with training (selffeed_ms: 690@2000 → 156@3500). The VAE
+corruption is **static** (a fixed AE trained once) → no compounding; in fact
+`vae_noise_blur` got *worse* with more training (1186@2000 → 1419@3500,
+train_loss 0.14→0.64). This is the structural reason selffeed is superior and why
+any proxy caps out. **Implication for the weather model:** if you can enable even a
+small auxiliary AR head to generate context-frame proxies, scheduled sampling
+unlocks the compounding benefit; otherwise the sharp-AE proxy is the best static
+option (~1186).
 
 **Critical principle: the corruption MUST stay sharp.** A normal VAE (KL>0)
 blurs its reconstruction AND its decoder regresses perturbed latents to the data
