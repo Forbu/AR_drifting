@@ -11,8 +11,20 @@
 - **Restart / renoise during ODE sampling** (stochastic sampler) at each AR step —
   sampling-side mechanism, orthogonal to training aug. UNTESTED (likely marginal:
   within-sample quality isn't the bottleneck; context drift is, already addressed).
-- **Classifier-free guidance** on the context (drop context w.p. during training,
-  guide at inference). UNTESTED.
+- ~~Classifier-free guidance (CFG)~~: FAILS both directions. GUIDANCE=2.0 ->
+  ED 690->2338 (artifacts, amplifies drifted context); GUIDANCE=0.5 -> ED 23827
+  (catastrophic blur, mean regression toward unconditional). Root cause: forecasting
+  is highly context-determined so the unconditional prior is uninformative. CFG
+  suits high-uncertainty generation, not forecasting.
+
+## STATUS: technique space EXHAUSTED
+All major stabilization mechanisms tested. Champions:
+- selffeed_ms (self-feed + 2-step rollout loss): ED 690@2000, 156@3500 (closed-loop).
+- vae_noise_blur (no-self-feed substitute): ED 1186, sharp 0.93 (static AE proxy).
+Failed: pixel noise, blur-alone, manifold/diff-forcing, 3-step loss, BPTT, EMA,
+  spectral, curriculum, inference-blur, CFG, selffeed2, jitter-on-VAE.
+Remaining low-prior: restart/stochastic sampler (within-sample quality isn't the
+  bottleneck; context drift is).
 
 ## Tried and did NOT help (do not retry without a new reason)
 - ~~Curriculum on selffeed probability (ramp 0→0.3)~~: WORSE (ED 747→2908) —
