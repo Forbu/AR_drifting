@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export CUBLAS_WORKSPACE_CONFIG=:4096:8  # required by torch deterministic algorithms
 set -a
 [ -f .auto/run.env ] && source .auto/run.env
 set +a

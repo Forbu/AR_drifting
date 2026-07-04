@@ -74,10 +74,14 @@ def _env(name, default, cast=float):
 
 SEED            = _env("SEED", 0, int)
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+DETERMINISTIC   = _env("DETERMINISTIC", 1, int)  # 1: deterministic CUDA for reproducible runs
 if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = not DETERMINISTIC
+    if DETERMINISTIC:
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
 IMG             = _env("IMG", 32, int)           # image side (H=W)
 C_CHAN          = _env("C_CHAN", 1, int)         # channels per frame
 K_CTX           = _env("K_CTX", 2, int)          # number of context frames
