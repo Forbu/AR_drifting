@@ -63,8 +63,25 @@ selffeed (scheduled sampling), diff_forcing, spectral, inference_blur.
 ## What's Been Tried
 (update as experiments accumulate)
 
-- baseline `pixnoise` (decoupled Gaussian voxel noise): TBD
-- `blur` (decoupled 3D Gaussian blur): TBD — expected to win (reproduces user finding)
+Full results + mechanism in `FINDINGS_VIDEO.md`. Summary:
+
+| Technique | rollout_ed | sharp | mass_drift | verdict |
+|---|---|---|---|---|
+| pixnoise (baseline) | 9770 | 0.18 | 0.65 | FAILS — blurry |
+| blur σ=0.8 | 5214 | 1.65 | 0.28 | works but artifacts+precision loss |
+| manifold_noise | 1635 | 0.98 | 0.05 | best per-frame quality; cheap |
+| **selffeed** p=0.3+blur0.4 | **725** | 0.88 | 0.08 | best stability (7x blur, 13x pixnoise) |
+| selffeed no-blur | 1200 | 0.65 | 0.24 | blur is needed |
+| selffeed p=0.2 / p=0.5 | 1410/5869 | — | — | optimum at 0.3 |
+| selffeed2 (2-step) | 988 | 0.77 | 0.18 | deeper compounding doesn't help |
+| **selffeed_m** (champion) | **747** | **0.90** | **0.07** | stable + sharp |
+
+**Winner: scheduled sampling (selffeed) + on-manifold amplitude jitter.**
+Generalizes to C=2 / different seed (3x pixnoise, sharpness 0.88).
+
+Key insight: rollout instability = exposure bias. Pixel noise is implausible
+for image data (breaks structure); the BEST degraded context is the model's own
+predictions (scheduled sampling) + mild blur to smooth them.
 
 ## Key Insight from Prior Work (FINDINGS.md)
 Stability comes from the model **seeing degraded conditions during training** so it
