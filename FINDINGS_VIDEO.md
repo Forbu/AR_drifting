@@ -28,9 +28,11 @@ sharpness_ratio ~1.0 and mass_drift ~0 are ideal).
   equal rollout_ed. **Recommended config.**
 - **Reproduces the user's real-world finding**: plain Gaussian pixel/voxel noise
   on the context **fails** on structured image data (sharpness 0.18 — catastrophic
-  blur, mass_drift 0.65). **Blur works** (ED 9770→5214) but introduces artifacts
-  (sharpness 1.65) and precision loss (train_loss 0.16→3.37). Scheduled sampling
-  beats both with **none** of those side-effects.
+  blur, mass_drift 0.65) — and is in fact **WORSE than no augmentation at all**
+  (pixnoise ED 9770 vs no-aug ED 5940) on slow/weather-like motion. **Blur works**
+  (ED 9770→5214) but introduces artifacts (sharpness 1.65) and precision loss
+  (train_loss 0.16→3.37). Scheduled sampling beats both with **none** of those
+  side-effects.
 - **All pixel-noise-based augmentation fails on image data regardless of schedule**
   (pixnoise ED 9770, diff_forcing ED 5540) — the noise *type* matters more than
   the schedule. Pixel noise breaks local blob/profile structure.
@@ -53,7 +55,8 @@ sharpness_ratio ~1.0 and mass_drift ~0 are ideal).
 
 | Technique | rollout_ed | ed_late | sharpness | mass_drift | train_loss | wall_s | note |
 |---|---|---|---|---|---|---|---|
-| **pixnoise** (baseline) | **9770** | 15571 | 0.18 | 0.65 | 0.16 | 64 | blurry — pixel noise fails on images |
+| none (no aug) | 5940 | 12283 | 0.57 | 0.27 | 0.44 | 66 | no-aug fails; note pixnoise is even worse |
+| **pixnoise** (baseline) | **9770** | 15571 | 0.18 | 0.65 | 0.16 | 64 | blurry — pixel noise is WORSE than no-aug on slow image data |
 | **blur** σ=0.8 | 5214 | 6240 | 1.65 | 0.28 | 3.37 | 66 | works but artifacts + precision loss |
 | manifold_noise | 1635 | 2441 | **0.98** | **0.05** | 0.12 | 65 | best per-frame quality; cheap; less stable than selffeed |
 | diff_forcing (per-frame pixnoise) | 5540 | 11395 | 0.46 | 0.41 | 0.15 | 65 | pixel-noise schedule still fails |
