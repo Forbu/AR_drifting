@@ -106,6 +106,13 @@ SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
+# VAE/AE-latent context corruption (simulates rollout drift without model self-outputs)
+VAE_LATENT      = _env("VAE_LATENT", 32, int)
+VAE_EPOCHS      = _env("VAE_EPOCHS", 12, int)
+VAE_NOISE       = _env("VAE_NOISE", 0.5, float)   # latent noise magnitude (in latent-std units)
+VAE_BETA        = _env("VAE_BETA", 1e-3, float)   # KL weight (small -> sharp recon; ~0 = autoencoder)
+_VAE = None   # global trained corruptor (vae, latent_std), set in main
+MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 
 
 # --------------------------------------------------------------------------- #
@@ -277,6 +284,78 @@ class VideoRF(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# 2b. VAE/AE CORRUPTOR — learns the data manifold, then corrupts context frames
+#     via encode -> add latent noise -> decode. Produces on-manifold "drifted"
+#     frames WITHOUT needing the model's own outputs or extra data (the
+#     scheduled-sampling substitute when self-feeding is impossible, e.g.
+#     4->3 joint prediction with a fixed 7-frame dataset).
+# --------------------------------------------------------------------------- #
+class FrameVAE(nn.Module):
+    def __init__(self, c_chan, base=32, latent=32):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv2d(c_chan, base, 3, stride=2, padding=1), nn.SiLU(),     # 16
+            nn.Conv2d(base, base*2, 3, stride=2, padding=1), nn.SiLU(),    # 8
+            nn.Conv2d(base*2, base*4, 3, stride=2, padding=1), nn.SiLU(),  # 4
+        )
+        self.flat_dim = base*4*4*4
+        self.fc_mu = nn.Linear(self.flat_dim, latent)
+        self.fc_lv = nn.Linear(self.flat_dim, latent)
+        self.fc_dec = nn.Linear(latent, self.flat_dim)
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(base*4, base*2, 4, stride=2, padding=1), nn.SiLU(),  # 8
+            nn.ConvTranspose2d(base*2, base, 4, stride=2, padding=1), nn.SiLU(),    # 16
+            nn.ConvTranspose2d(base, c_chan, 4, stride=2, padding=1),               # 32
+        )
+        self.base = base
+
+    def encode(self, x):
+        h = self.enc(x).flatten(1)
+        return self.fc_mu(h), self.fc_lv(h)
+
+    def decode(self, z):
+        h = self.fc_dec(z).view(-1, self.base*4, 4, 4)
+        return self.dec(h)
+
+
+def train_vae(frames, c_chan, epochs, latent, beta):
+    """Train a VAE (beta~0 => sharp autoencoder) on all dataset frames."""
+    vae = FrameVAE(c_chan, latent=latent).to(DEVICE)
+    opt = torch.optim.AdamW(vae.parameters(), lr=3e-3)
+    X = frames.detach()
+    n = X.shape[0]
+    bs = 256
+    for ep in range(epochs):
+        perm = torch.randperm(n, device=DEVICE)
+        for i in range(0, n, bs):
+            xb = X[perm[i:i+bs]]
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                mu, lv = vae.encode(xb)
+                z = mu + torch.exp(0.5*lv) * torch.randn_like(mu)
+                xr = vae.decode(z)
+                recon = ((xr - xb)**2).mean()
+                kl = (-0.5 * (1 + lv - mu**2 - torch.exp(lv)).sum(dim=1)).mean()
+                loss = recon + beta * kl
+            opt.zero_grad(); loss.backward(); opt.step()
+    with torch.no_grad():
+        mu, lv = vae.encode(X)
+        latent_std = float(torch.exp(0.5*lv).mean().item())
+        recon_err = float(((vae.decode(mu) - X)**2).mean().item())
+    return vae, max(latent_std, 1e-3), recon_err
+
+
+def vae_perturb(vae, frames, noise_std, latent_std):
+    """frames: (..., C,H,W) -> on-manifold corrupted frames (same shape)."""
+    shape = frames.shape
+    flat = frames.reshape(-1, *shape[-3:])
+    with torch.no_grad():
+        mu, _ = vae.encode(flat)
+        z = mu + (noise_std * latent_std) * torch.randn_like(mu)
+        out = vae.decode(z)
+    return out.reshape(*shape).float()
+
+
+# --------------------------------------------------------------------------- #
 # 3. CONTEXT AUGMENTATION — THE LEVER
 # --------------------------------------------------------------------------- #
 def _gauss_kernel_2d(sigma, device):
@@ -327,6 +406,18 @@ def augment_context(ctx, model=None, extra=None, training=True):
         sb = torch.sigmoid(1.0 + 1.8 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1 - 1e-3) * BLUR_SIGMA
         blurred = _blur2d(ctx, float(sb.mean()))
         return blurred + torch.randn_like(ctx) * (SIGMA * 0.5)
+
+    if TECHNIQUE in ("vae_noise", "vae_noise_blur"):
+        # VAE/AE-latent context corruption: encode -> add latent noise -> decode.
+        # On-manifold "drifted" frames without model self-outputs (self-feed substitute).
+        if _VAE is None:
+            return ctx
+        vae, lstd, _ = _VAE
+        s = torch.sigmoid(1.0 + 1.8 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
+        corrupted = vae_perturb(vae, ctx, float(s.mean()), lstd)
+        if TECHNIQUE == "vae_noise_blur":
+            corrupted = _blur2d(corrupted, BLUR_SIGMA * 0.4)
+        return corrupted
 
     if TECHNIQUE == "manifold_noise":
         # manifold-aligned-ish: mild blur (smooth, plausible) + amplitude jitter
@@ -582,6 +673,13 @@ def main():
     ed_floor = energy_distance(floor_feat, ref_f)
     print(f"[data] ref feats={ref_f.shape} bw={bw:.3f} ed_floor={ed_floor:.6f} "
           f"mmd_floor={mmd_floor:.6f} ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
+
+    global _VAE
+    if TECHNIQUE.startswith("vae_noise"):
+        print(f"[vae] training corruptor latent={VAE_LATENT} epochs={VAE_EPOCHS} beta={VAE_BETA}", flush=True)
+        vae, lstd, rerr = train_vae(train_data.frames, C_CHAN, VAE_EPOCHS, VAE_LATENT, VAE_BETA)
+        _VAE = (vae, lstd, rerr)
+        print(f"[vae] trained. latent_std={lstd:.4f} recon_mse={rerr:.6f}", flush=True)
 
     print(f"[train] {TRAIN_STEPS} steps batch={BATCH}", flush=True)
     model, train_loss = train(train_data)
