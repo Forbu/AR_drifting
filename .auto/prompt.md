@@ -85,14 +85,18 @@ variance from GPU non-determinism × chaotic-rollout amplification (a false "285
 outlier appeared and did NOT reproduce). Now single runs reproduce exactly.
 
 Reproducible-regime numbers (lower=better):
-| Technique | rollout_ed | sharp | mass_drift | note |
+| Technique | rollout_ed@2000 | rollout_ed@3500 | sharp@3500 | note |
 |---|---|---|---|---|
-| pixnoise | 6746 | 0.22 | 0.64 | fails |
-| selffeed_m | 912 | 0.87 | 0.08 | scheduled sampling + amplitude jitter |
-| **selffeed_ms (champion)** | **690** | 0.91 | 0.02 | + 2-step rollout loss (MS_PROB=0.3) |
+| pixnoise | 6746 | 2887 | 0.67 | fails |
+| selffeed_m | 912 | — | — | scheduled sampling + amplitude jitter |
+| **selffeed_ms (champion)** | **690** | **156** | 0.92 | + 2-step rollout loss (MS_PROB=0.3) |
 
-selffeed_ms improves on selffeed_m by 24% (912->690) and is 9.8x better than pixnoise.
-MS_PROB sweep: 0.15->725, 0.3->690 (optimum), 0.5->1023.
+selffeed_ms is **9.8× better than pixnoise at 2000 steps and 18.5× at 3500**
+(the gap WIDENS with training — the win is the technique, not compute; both
+improve with budget but selffeed_ms far faster). TRAIN_STEPS=5000 is impractical
+(timeout). Standard iteration regime = 2000; max-quality = 3500 (ED 156).
+MS_PROB sweep: 0.15->725, 0.3->690 (optimum), 0.5->1023. MS_DEPTH: 2 optimal
+(3->870). BPTT (gradient through pred): worse, mode collapse -> DETACH.
 
 Key insight: rollout instability = exposure bias. Selffeed augments the INPUT
 context (feeds model's own predictions); the multi-step rollout loss adds a LOSS
