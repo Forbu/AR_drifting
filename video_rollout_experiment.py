@@ -454,7 +454,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
             out = _blur2d(out, BLUR_SIGMA * 0.4)
         return out
 
-    if TECHNIQUE in ("vae_noise", "vae_noise_blur", "vae_noise_blurj"):
+    if TECHNIQUE in ("vae_noise", "vae_noise_blur", "vae_noise_blurj", "vae_ms"):
         # VAE/AE-latent context corruption: encode -> add latent noise -> decode.
         # On-manifold "drifted" frames without model self-outputs (self-feed substitute).
         if _VAE is None:
@@ -462,7 +462,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
         vae, lstd, _, _ = _VAE
         s = torch.sigmoid(1.0 + 1.8 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
         corrupted = vae_perturb(vae, ctx, float(s.mean()), lstd)
-        if TECHNIQUE in ("vae_noise_blur", "vae_noise_blurj"):
+        if TECHNIQUE in ("vae_noise_blur", "vae_noise_blurj", "vae_ms"):
             corrupted = _blur2d(corrupted, BLUR_SIGMA * 0.4)
         if TECHNIQUE == "vae_noise_blurj":
             # on-manifold amplitude jitter (keeps sharpness, like selffeed_m)
@@ -578,9 +578,19 @@ def train(data):
             loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
         # multi-step rollout loss: predict tgt2 from [ctx[:,1], model_pred(tgt)],
         # training the model to stay consistent when its own output is fed back.
-        if TECHNIQUE in ("selffeed_ms", "selffeed_msgate") and MS_PROB > 0 and rng.rand() < MS_PROB:
-            with torch.no_grad():
-                pred1 = sample_step(model, ctx, ODE_STEPS, guidance=1.0)  # model's pred of tgt from CLEAN ctx (matches inference)
+        if TECHNIQUE in ("selffeed_ms", "selffeed_msgate", "vae_ms") and MS_PROB > 0 and rng.rand() < MS_PROB:
+            if TECHNIQUE == "vae_ms" and _VAE is not None:
+                # SELF-FEED-FREE multi-step loss: use an AE-corrupted version of the
+                # REAL frame t (not a model prediction) as the drifted context for
+                # predicting t+1. Emulates rollout drift as a LOSS, no self-outputs.
+                vae, lstd, _, _ = _VAE
+                s = float((torch.sigmoid(1.0 + 1.8 * torch.randn(1, device=DEVICE)).clamp(1e-3, 1 - 1e-3)) * VAE_NOISE)
+                with torch.no_grad():
+                    pred1 = vae_perturb(vae, tgt, s, lstd)   # AE-corrupted real frame t
+                    pred1 = _blur2d(pred1, BLUR_SIGMA * 0.4)
+            else:
+                with torch.no_grad():
+                    pred1 = sample_step(model, ctx, ODE_STEPS, guidance=1.0)  # model's pred of tgt from CLEAN ctx
             ctx2 = torch.stack([ctx[:, 1], pred1], dim=1)   # B,K,C,H,W
             ctx2_aug = augment_context(ctx2, model=model, extra=extra, training=True)
             t2 = torch.rand(BATCH, device=DEVICE)
@@ -754,7 +764,7 @@ def main():
           f"mmd_floor={mmd_floor:.6f} ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
 
     global _VAE
-    if TECHNIQUE.startswith("vae_noise") or TECHNIQUE.startswith("vae_interp") or TECHNIQUE.startswith("vae_interptemp"):
+    if TECHNIQUE.startswith("vae_noise") or TECHNIQUE.startswith("vae_interp") or TECHNIQUE.startswith("vae_interptemp") or TECHNIQUE == "vae_ms":
         print(f"[vae] training corruptor latent={VAE_LATENT} epochs={VAE_EPOCHS} beta={VAE_BETA}", flush=True)
         vae, lstd, rerr, bank = train_vae(train_data.frames, C_CHAN, VAE_EPOCHS, VAE_LATENT, VAE_BETA)
         _VAE = (vae, lstd, rerr, bank)
