@@ -175,6 +175,9 @@ Results (deterministic, TRAIN_STEPS=2000):
 | **AE aug + self-feed-free multi-step loss (vae_ms)** | **1106** | 0.92 | **best no-self-feed (6.1× pixnoise)** — multi-step loss over AE-corrupted real frame |
 | selffeed_ms (needs self-outputs) | 690 | 0.91 | champion |
 
+vae_ms tuning: MS_PROB 0.15→1186, **0.3→1106 (optimum)**, 0.5→1798 (same 0.3
+optimum as self-feed); VAE_NOISE 0.2; β=1e-5; blur 0.4.
+
 VAE_NOISE sweep for the winner: 0.1→1600, **0.2→1186 (optimum)**, 0.3→2112
 (sharp valley). Adding amplitude jitter on top *hurt* (over-corruption, 2077).
 
