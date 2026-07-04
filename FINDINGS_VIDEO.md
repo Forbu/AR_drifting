@@ -31,6 +31,12 @@ sharpness_ratio ~1.0 and mass_drift ~0 are ideal).
   ed_late 1240 → 710 (stable end-to-end), mass_drift 0.08 → 0.02. The multi-step
   loss adds a *loss* on the model's own 2-step compounded output, closing the
   compounding gap that input-only selffeed misses. Reproducible (deterministic).
+- **Error-GATED self-feed ("selffeed_msgate") is the regime-robust champion**: gate
+  the self-feed by surrogate accuracy — keep only the low-error half (gate=0.5,
+  measured vs the real frame). ED 690 → **654** on sparse data, AND it fixes the
+  dense-data regime (multi-blob 2691 → 1822, near no-aug 1563). Adaptively
+  self-feeds when predictions are good (sparse), skips when poor (dense). No
+  sparsity detector needed. Gate sweep: 0.25→668, **0.5→654 (optimum)**, 0.75→699.
 - **Reproduces the user's real-world finding**: plain Gaussian pixel/voxel noise
   on the context **fails** on structured image data (sharpness 0.18 — catastrophic
   blur, mass_drift 0.65) — and is in fact **WORSE than no augmentation at all**
@@ -205,9 +211,14 @@ The self-feed recommendation is **regime-specific**. Tested on multi-feature dat
 
 | Technique | sparse (single blob) | dense (3 blobs) |
 |---|---|---|
-| no augmentation | 5940 | **1563** ✅ |
+| no augmentation | 5940 | **1563** |
 | pixel noise | 6746 | 1751 |
-| selffeed_ms | **690** ✅ | 2691 |
+| selffeed_ms (ungated) | **690** | 2691 |
+| **selffeed_msgate (error-gated, gate=0.5)** | **654** | 1822 |
+
+Error-gating recovers most of the dense-regime loss (2691→1822) while *improving*
+the sparse regime (690→654) — the regime-robust champion. On dense data no-aug
+remains best (1563); a stricter gate (0.25) gets closer but loses sparse benefit.
 
 On **sparse-feature** data self-feed helps ~9×; on **dense-feature** data
 augmentation of any kind *hurts* and no-aug is best. Two reasons:
