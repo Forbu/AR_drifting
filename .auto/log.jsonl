@@ -1,0 +1,1 @@
+{"type":"config","name":"Rollout stability for rectified-flow 2D video forecaster","metricName":"rollout_mmd","metricUnit":"","bestDirection":"lower"}
