@@ -141,6 +141,41 @@ the next-step loss.
 
 ---
 
+## No-self-feed substitute: VAE/AE-latent context corruption
+
+Scheduled sampling needs the model to *generate* context-like frames. For setups
+where that's impossible (e.g. the user's weather model: **4 ctx -> 3 future,
+predicted jointly, fixed 7-frame dataset** — no extra frames to roll out into, and
+the model only predicts *future* frames, not context frames), we tested a learned
+corruption model: train a VAE/AE on the data, corrupt context via **encode -> add
+latent noise -> decode** (no model self-outputs, no extra data).
+
+Results (deterministic, TRAIN_STEPS=2000):
+
+| Technique | rollout_ed | sharpness | note |
+|---|---|---|---|
+| pixnoise | 6746 | 0.22 | fails (blur) |
+| **VAE (β=1e-3) latent noise** | **12712** | **0.22** | **FAILS — worse than pixnoise!** |
+| manifold_noise (blur+jitter) | 2142 | 1.26 | artifacty |
+| AE (β≈1e-5) latent noise | 2113 | 0.77 | sharp AE works |
+| **AE latent noise + mild blur** | **1186** | **0.93** | **best no-self-feed (5.7× pixnoise)** |
+| selffeed_ms (needs self-outputs) | 690 | 0.91 | champion |
+
+**Critical principle: the corruption MUST stay sharp.** A normal VAE (KL>0)
+blurs its reconstruction AND its decoder regresses perturbed latents to the data
+mean → corrupted contexts are blurry/mean-ish → the model learns mean regression
+(ED 12712, identical failure to pixel noise, sharpness 0.22). Fix: use a **sharp
+autoencoder** (β≈0, recon MSE ~5e-6, near-perfect recon) + small latent noise +
+mild blur. Then corruptions are *sharp but slightly off-manifold* — the same
+regime as the model's own outputs that makes self-feed work. Adding amplitude
+jitter on top *hurt* (over-corruption).
+
+**Recommendation when self-feeding is impossible:** train a sharp AE on your
+frames; during RF training corrupt context frames (w.p. ~0.3, decoupled) via
+encode -> +small latent noise -> decode -> +mild blur. This is the best
+self-feed-free option found (5.7× better than pixel noise), though ~1.7× worse
+than true scheduled sampling (which remains preferable wherever feasible).
+
 ## Caveats / not overfitting
 
 - Validated on a *single-blob Lorenz* dataset. The mechanism (exposure-bias fix)
