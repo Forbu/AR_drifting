@@ -6,10 +6,8 @@
   More expensive; may help sharpness. UNTESTED. (Note: reasoned that detach is
   correct for the input-context surrogate, but BPTT through the multi-step LOSS
   is different and untested.)
-- ~~Consistency-loss / self-distillation~~: DONE as selffeed_ms (2-step rollout
-  loss) — REAL WIN, new champion (ED 912->690, reproducible).
-- **3-step rollout loss** (deeper than selffeed_ms's 2-step): untested, likely
-  diminishing returns.
+- ~~3-step rollout loss~~: WORSE (ED 690->870, slower). 2-step is the sweet spot;
+  deeper compounding adds noise.
 - **Restart / renoise during ODE sampling** (stochastic sampler) at each AR step —
   sampling-side mechanism, orthogonal to training aug. UNTESTED.
 - **Classifier-free guidance** on the context (drop context w.p. during training,
@@ -27,7 +25,8 @@
 - ~~diff_forcing (per-frame pixel noise)~~: fails like pixnoise (ED 5540).
 
 ## Generalization checks (do before trusting for production)
-- DONE: multichannel C=2 + SEED=1 (selffeed_m 3× better, sharpness 0.88). VALID.
+- DONE: multichannel C=2 + SEED=1 — BOTH selffeed_m (3x pixnoise, sharp 0.88)
+  AND selffeed_ms (2.9x pixnoise, sharp 0.91) generalize. VALID, no overfit.
 - DONE: fast-motion regime (dt=0.024) — ranking FLIPS (regime-dependent; documented).
 - INCONCLUSIVE: IMG=64 needs ~4000 steps to train the model; at 1000 steps the
   MODEL is undertrained (train_loss 1.6 vs 0.12) so no technique works. Re-run

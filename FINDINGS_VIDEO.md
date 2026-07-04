@@ -138,8 +138,11 @@ not synthetic noise.
 - Validated on a *single-blob Lorenz* dataset. The mechanism (exposure-bias fix)
   is data-agnostic, but the exact probability / blur σ should be re-tuned on real
   weather frames.
-- Confirmed generalization to **multichannel (C=2)** and a different seed
-  (selffeed_m: sharpness 0.88, mass_drift 0.07, 3× better ED than pixnoise).
+- Confirmed generalization to **multichannel (C=2)** and a different seed,
+  including the NEW champion `selffeed_ms` (deterministic, SEED=1, C=2):
+  ED 12269 vs pixnoise 35265 (**2.9× better**), sharpness **0.91**, mass_drift
+  **0.05**. The added 2-step rollout loss did NOT overfit to the single-channel
+  benchmark. (Earlier `selffeed_m` C=2: 3× better, sharpness 0.88.)
 - The metric (energy distance on pooled+gradient features) is non-saturating and
   tracks both position drift and texture/artifact drift (sharpness, mass).
 - Energy distance replaces an earlier Gaussian-kernel MMD which **saturated** at
