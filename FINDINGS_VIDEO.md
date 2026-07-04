@@ -217,14 +217,26 @@ The self-feed recommendation is **regime-specific**. Tested on multi-feature dat
 
 | Technique | sparse (single blob) | dense (3 blobs) |
 |---|---|---|
-| no augmentation | 5940 | **1563** |
+| no augmentation | 5940 | 1563 |
 | pixel noise | 6746 | 1751 |
-| selffeed_ms (ungated) | **690** | 2691 |
-| **selffeed_msgate (error-gated, gate=0.5)** | **654** | 1822 |
+| selffeed_ms (ungated) | 690 | 2691 ❌ |
+| selffeed_msgate (error-gated, gate=0.5) | 654 | 1822 |
+| **vae_ms (AE-corruption + self-feed-free multi-step loss)** | 1106 | **821** ✅ |
 
-Error-gating recovers most of the dense-regime loss (2691→1822) while *improving*
-the sparse regime (690→654) — the regime-robust champion. On dense data no-aug
-remains best (1563); a stricter gate (0.25) gets closer but loses sparse benefit.
+**`vae_ms` is regime-robust** — it works on *both* regimes and is the only technique
+that excels on dense data (821, beating even no-aug 1563 by 1.9×). Self-feed is
+sparse-only: it wins on sparse (654) but catastrophically fails on dense (2691).
+Reason: `vae_ms` corruption is **static + on-manifold** (no mean-regression like
+pixel noise, no dependence on model prediction quality like self-feed), so it
+regularizes consistently regardless of task difficulty.
+
+**This corrects the earlier "augmentation hurts on dense" claim** — only *bad*
+augmentation (pixel noise → mean regression; self-feed → bad surrogate) hurts on
+dense. On-manifold AE corruption *helps* on dense.
+
+**Recommendation for mixed sparse/dense real weather data:** `vae_ms` is the
+robust default (works everywhere). Use self-feed *only* if your data is reliably
+sparse AND you can generate self-feed signals; otherwise prefer `vae_ms`.
 
 On **sparse-feature** data self-feed helps ~9×; on **dense-feature** data
 augmentation of any kind *hurts* and no-aug is best. Two reasons:
