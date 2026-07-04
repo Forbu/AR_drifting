@@ -79,9 +79,17 @@ Full results + mechanism in `FINDINGS_VIDEO.md`. Summary:
 **Winner: scheduled sampling (selffeed) + on-manifold amplitude jitter.**
 Generalizes to C=2 / different seed (3x pixnoise, sharpness 0.88).
 
+**DETERMINISTIC REGIME (2026-07-04):** switched to `torch.use_deterministic_algorithms`
++ `CUBLAS_WORKSPACE_CONFIG` + `cudnn.deterministic`. Prior runs had ~±50% run-to-run
+variance from GPU non-determinism × chaotic-rollout amplification (a false "285" ED
+outlier appeared and did NOT reproduce). Now single runs reproduce exactly (verified:
+selffeed_m → 912.186462 three times). Reproducible numbers: pixnoise=6746,
+selffeed_m=912 (7.4× better), selffeed_m BLUR_SIGMA=1.5=1015 (worse than 1.0 — the
+blur sweep is now resolved: 1.0 wins). Cost: ~20% slower (170s→215s).
+
 Key insight: rollout instability = exposure bias. Pixel noise is implausible
 for image data (breaks structure); the BEST degraded context is the model's own
-predictions (scheduled sampling) + mild blur to smooth them.
+predictions (scheduled sampling) + mild blur (σ≈0.4) to smooth them.
 
 ## Key Insight from Prior Work (FINDINGS.md)
 Stability comes from the model **seeing degraded conditions during training** so it

@@ -131,6 +131,15 @@ not synthetic noise.
 - Energy distance replaces an earlier Gaussian-kernel MMD which **saturated** at
   an identical value (0.404) for both pixnoise and blur (k_ab→0, mbb→1 ceiling)
   and was useless for measuring improvements.
+- **METRIC VARIANCE / DETERMINISM (important methodological note):** non-deterministic
+  CUDA kernels (conv/groupnorm backward) × chaotic-rollout amplification produced
+  ~±50% run-to-run ED variance even with fixed seeds — a single run once gave a
+  false ED=285 that did NOT reproduce (real value ~750-1000). Fixed by enabling
+  `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+  + `cudnn.deterministic`. Verified reproducible (selffeed_m → 912.186462 three
+  times identically). Reproducible-regime numbers: pixnoise=6746, selffeed_m=912
+  (BLUR_SIGMA=1.0). Cost ~20% slower. **Lesson: always verify reproducibility
+  before trusting a surprising win on a chaotic benchmark.**
 
 ## Reproducing
 
