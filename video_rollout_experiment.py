@@ -89,6 +89,7 @@ N_TRAJ_TRAIN    = _env("N_TRAJ_TRAIN", 220, int)
 N_TRAJ_HOLD     = _env("N_TRAJ_HOLD", 40, int)
 TRAJ_LEN        = _env("TRAJ_LEN", 80, int)      # frames per trajectory
 LORENZ_DT       = _env("LORENZ_DT", 0.012, float)
+N_BLOBS         = _env("N_BLOBS", 0, int)       # extra INDEPENDENT blobs (own Lorenz traj) summed into ch0 - overfitting test
 BLOB_SIGMA      = _env("BLOB_SIGMA", 2.2, float) # pixel width
 # training
 TRAIN_STEPS     = _env("TRAIN_STEPS", 2000, int)
@@ -184,19 +185,33 @@ class VideoSequenceData:
         for t in range(n_traj):
             traj = lorenz_trajectory(traj_len, lorenz_dt, seed + t)
             normed = (traj - lo) / (hi - lo)  # ~[0,1]
+            # extra INDEPENDENT blobs (each its own Lorenz trajectory) for the
+            # multi-feature generalization test (N_BLOBS>0)
+            extra = []
+            for b in range(N_BLOBS):
+                et = lorenz_trajectory(traj_len, lorenz_dt, seed + 100000*(b+1) + t)
+                extra.append((et - lo) / (hi - lo))
             tt = np.arange(traj_len) * lorenz_dt
             amp_master = 0.78 + 0.18 * np.sin(0.6 * tt + t).astype(np.float32)
             for i in range(traj_len):
                 latent = normed[i]  # (3,)
                 centers2d = proj @ latent  # (C,2)
-                # map [-something, something] -> [1.5, img-1.5]
                 centers2d = centers2d * (img * 0.18) + img * 0.5
                 centers2d = np.clip(centers2d, 1.5, img - 1.5)
-                # per-channel amplitude variation
                 amps = (amp_master[i] * (0.7 + 0.3 * np.arange(c_chan) / max(1, c_chan - 1))).astype(np.float32)
                 ct = torch.tensor(centers2d, dtype=torch.float32, device=DEVICE)
                 ap = torch.tensor(amps, dtype=torch.float32, device=DEVICE)
-                all_frames.append(renderer.render(ct, ap, blob_sigma))
+                frame = renderer.render(ct, ap, blob_sigma)  # (C,H,W)
+                if extra:
+                    # add independent blobs into channel 0 with random projections
+                    for b, et in enumerate(extra):
+                        c2 = (np.array([[0.9, 0.2, -0.1], [0.1, 0.8, 0.2]]) * (b + 1) @ et[i])
+                        c2 = np.clip(c2 * (img * 0.18) + img * 0.5, 1.5, img - 1.5)
+                        ct2 = torch.tensor(c2, dtype=torch.float32, device=DEVICE)
+                        ap2 = torch.tensor([0.7 - 0.1 * b], dtype=torch.float32, device=DEVICE)
+                        frame[0] = frame[0] + renderer.render(ct2, ap2, blob_sigma)[0]
+                    frame = frame.clamp(max=1.5)
+                all_frames.append(frame)
             self.traj_starts.append(idx)
             idx += traj_len
         self.n_traj = n_traj
