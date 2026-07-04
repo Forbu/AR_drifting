@@ -341,7 +341,8 @@ def train_vae(frames, c_chan, epochs, latent, beta):
         mu, lv = vae.encode(X)
         latent_std = float(torch.exp(0.5*lv).mean().item())
         recon_err = float(((vae.decode(mu) - X)**2).mean().item())
-    return vae, max(latent_std, 1e-3), recon_err
+        latent_bank = mu.clone()  # (N, latent) for manifold-interpolation corruption
+    return vae, max(latent_std, 1e-3), recon_err, latent_bank
 
 
 def vae_perturb(vae, frames, noise_std, latent_std):
@@ -407,12 +408,32 @@ def augment_context(ctx, model=None, extra=None, training=True):
         blurred = _blur2d(ctx, float(sb.mean()))
         return blurred + torch.randn_like(ctx) * (SIGMA * 0.5)
 
+    if TECHNIQUE in ("vae_interp", "vae_interp_blur"):
+        # Manifold-interpolation corruption: blend the context frame's latent toward
+        # a RANDOM other real frame's latent, then decode. Both endpoints are real
+        # -> decode stays on-manifold and sharp (vs noise which drifts off-manifold).
+        if _VAE is None:
+            return ctx
+        vae, _, _, bank = _VAE
+        shape = ctx.shape
+        flat = ctx.reshape(-1, *shape[-3:])           # (B*K, C,H,W)
+        with torch.no_grad():
+            mu, _ = vae.encode(flat)
+            idx = torch.randint(0, bank.shape[0], (mu.shape[0],), device=mu.device)
+            mu_rand = bank[idx]
+            a = torch.sigmoid(1.0 + 1.8 * torch.randn(mu.shape[0], 1, device=mu.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
+            z = (1 - a) * mu + a * mu_rand
+            out = vae.decode(z).reshape(*shape).float()
+        if TECHNIQUE == "vae_interp_blur":
+            out = _blur2d(out, BLUR_SIGMA * 0.4)
+        return out
+
     if TECHNIQUE in ("vae_noise", "vae_noise_blur", "vae_noise_blurj"):
         # VAE/AE-latent context corruption: encode -> add latent noise -> decode.
         # On-manifold "drifted" frames without model self-outputs (self-feed substitute).
         if _VAE is None:
             return ctx
-        vae, lstd, _ = _VAE
+        vae, lstd, _, _ = _VAE
         s = torch.sigmoid(1.0 + 1.8 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
         corrupted = vae_perturb(vae, ctx, float(s.mean()), lstd)
         if TECHNIQUE in ("vae_noise_blur", "vae_noise_blurj"):
@@ -679,10 +700,10 @@ def main():
           f"mmd_floor={mmd_floor:.6f} ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
 
     global _VAE
-    if TECHNIQUE.startswith("vae_noise"):
+    if TECHNIQUE.startswith("vae_noise") or TECHNIQUE.startswith("vae_interp"):
         print(f"[vae] training corruptor latent={VAE_LATENT} epochs={VAE_EPOCHS} beta={VAE_BETA}", flush=True)
-        vae, lstd, rerr = train_vae(train_data.frames, C_CHAN, VAE_EPOCHS, VAE_LATENT, VAE_BETA)
-        _VAE = (vae, lstd, rerr)
+        vae, lstd, rerr, bank = train_vae(train_data.frames, C_CHAN, VAE_EPOCHS, VAE_LATENT, VAE_BETA)
+        _VAE = (vae, lstd, rerr, bank)
         print(f"[vae] trained. latent_std={lstd:.4f} recon_mse={rerr:.6f}", flush=True)
 
     print(f"[train] {TRAIN_STEPS} steps batch={BATCH}", flush=True)
