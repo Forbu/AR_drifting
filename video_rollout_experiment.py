@@ -408,10 +408,11 @@ def augment_context(ctx, model=None, extra=None, training=True):
         blurred = _blur2d(ctx, float(sb.mean()))
         return blurred + torch.randn_like(ctx) * (SIGMA * 0.5)
 
-    if TECHNIQUE in ("vae_interp", "vae_interp_blur"):
-        # Manifold-interpolation corruption: blend the context frame's latent toward
-        # a RANDOM other real frame's latent, then decode. Both endpoints are real
-        # -> decode stays on-manifold and sharp (vs noise which drifts off-manifold).
+    if TECHNIQUE in ("vae_interp", "vae_interp_blur", "vae_interptemp", "vae_interptemp_blur"):
+        # Latent-interpolation corruption. Random-frame blend (vae_interp*) gives
+        # two-blob artifacts; TEMPORAL-neighbor blend (vae_interptemp*) shifts the
+        # blob to a nearby on-manifold position (realistic rollout error: the model
+        # predicting the blob slightly off-position), staying sharp & single-blob.
         if _VAE is None:
             return ctx
         vae, _, _, bank = _VAE
@@ -419,12 +420,17 @@ def augment_context(ctx, model=None, extra=None, training=True):
         flat = ctx.reshape(-1, *shape[-3:])           # (B*K, C,H,W)
         with torch.no_grad():
             mu, _ = vae.encode(flat)
-            idx = torch.randint(0, bank.shape[0], (mu.shape[0],), device=mu.device)
-            mu_rand = bank[idx]
+            if TECHNIQUE.startswith("vae_interptemp"):
+                # temporal successor (bank is stored in trajectory order)
+                idx = torch.randint(0, max(1, bank.shape[0] - 1), (mu.shape[0],), device=mu.device)
+                mu_tgt = bank[idx + 1]
+            else:
+                idx = torch.randint(0, bank.shape[0], (mu.shape[0],), device=mu.device)
+                mu_tgt = bank[idx]
             a = torch.sigmoid(1.0 + 1.8 * torch.randn(mu.shape[0], 1, device=mu.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
-            z = (1 - a) * mu + a * mu_rand
+            z = (1 - a) * mu + a * mu_tgt
             out = vae.decode(z).reshape(*shape).float()
-        if TECHNIQUE == "vae_interp_blur":
+        if TECHNIQUE in ("vae_interp_blur", "vae_interptemp_blur"):
             out = _blur2d(out, BLUR_SIGMA * 0.4)
         return out
 
@@ -700,7 +706,7 @@ def main():
           f"mmd_floor={mmd_floor:.6f} ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
 
     global _VAE
-    if TECHNIQUE.startswith("vae_noise") or TECHNIQUE.startswith("vae_interp"):
+    if TECHNIQUE.startswith("vae_noise") or TECHNIQUE.startswith("vae_interp") or TECHNIQUE.startswith("vae_interptemp"):
         print(f"[vae] training corruptor latent={VAE_LATENT} epochs={VAE_EPOCHS} beta={VAE_BETA}", flush=True)
         vae, lstd, rerr, bank = train_vae(train_data.frames, C_CHAN, VAE_EPOCHS, VAE_LATENT, VAE_BETA)
         _VAE = (vae, lstd, rerr, bank)
