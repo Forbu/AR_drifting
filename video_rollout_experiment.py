@@ -105,6 +105,7 @@ BLUR_SIGMA      = _env("BLUR_SIGMA", 1.2, float) # 2D gaussian blur std
 SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
+MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,18 +195,21 @@ class VideoSequenceData:
         self.N = self.frames.shape[0]
 
     def sample_windows(self, batch_size, rng):
-        """Returns (ctx [B,K,C,H,W], target [B,C,H,W], extra [B,C,H,W])."""
+        """Returns (ctx [B,K,C,H,W], target [B,C,H,W], extra [B,C,H,W], tgt2 [B,C,H,W]).
+        tgt2 = frame at pi+1 (for multi-step rollout loss)."""
         B = batch_size
         ti = rng.randint(0, self.n_traj, size=B)
-        pi = rng.randint(K_CTX, self.traj_len - 1, size=B)
+        pi = rng.randint(K_CTX, self.traj_len - 2, size=B)  # leave room for tgt2=pi+1
         base = np.array(self.traj_starts)[ti]
         idx_ctx = np.stack([base + pi - K_CTX + k for k in range(K_CTX)], axis=1)  # B,K
         idx_tgt = base + pi
         idx_extra = base + pi - K_CTX - 1
+        idx_tgt2 = base + pi + 1
         ctx = self.frames[idx_ctx]            # B,K,C,H,W
         tgt = self.frames[idx_tgt]            # B,C,H,W
         extra = self.frames[idx_extra]        # B,C,H,W
-        return ctx, tgt, extra
+        tgt2 = self.frames[idx_tgt2]          # B,C,H,W
+        return ctx, tgt, extra, tgt2
 
 
 # --------------------------------------------------------------------------- #
@@ -331,7 +335,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
         scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
         return blurred * scale
 
-    if TECHNIQUE in ("selffeed", "selffeed_m"):
+    if TECHNIQUE in ("selffeed", "selffeed_m", "selffeed_ms"):
         # scheduled sampling: w.p. SELFFEED_PROB replace LAST context frame with
         # the model's own 1-step forecast from [extra, ctx[:,0]] (detached).
         out = ctx.clone()
@@ -343,7 +347,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
                     pred = sample_step(model, sur_ctx, ODE_STEPS)
                 out[mask, 1] = pred
         blurred = _blur2d(out, BLUR_SIGMA * 0.4)
-        if TECHNIQUE == "selffeed_m":
+        if TECHNIQUE in ("selffeed_m", "selffeed_ms"):
             # manifold perturbation: + on-manifold amplitude jitter (keeps sharpness)
             scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
             return blurred * scale
@@ -394,7 +398,7 @@ def train(data):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, TRAIN_STEPS)
     last_loss = 0.0
     for step in range(TRAIN_STEPS):
-        ctx, tgt, extra = data.sample_windows(BATCH, rng)
+        ctx, tgt, extra, tgt2 = data.sample_windows(BATCH, rng)
         t = torch.rand(BATCH, device=DEVICE)
         eps = torch.randn_like(tgt)
         z_t = (1 - t.view(-1, 1, 1, 1)) * eps + t.view(-1, 1, 1, 1) * tgt
@@ -407,6 +411,22 @@ def train(data):
             loss_vel = ((v_pred - v_target) ** 2).mean(dim=(1, 2, 3)) * w
             x_pred = model.forward(z_t, ctx_aug, t)
             loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
+        # multi-step rollout loss: predict tgt2 from [ctx[:,1], model_pred(tgt)],
+        # training the model to stay consistent when its own output is fed back.
+        if TECHNIQUE == "selffeed_ms" and MS_PROB > 0 and rng.rand() < MS_PROB:
+            with torch.no_grad():
+                pred1 = sample_step(model, ctx, ODE_STEPS)  # model's pred of tgt from CLEAN ctx (matches inference)
+            ctx2 = torch.stack([ctx[:, 1], pred1], dim=1)   # B,K,C,H,W
+            ctx2_aug = augment_context(ctx2, model=model, extra=extra, training=True)
+            t2 = torch.rand(BATCH, device=DEVICE)
+            eps2 = torch.randn_like(tgt2)
+            z_t2 = (1 - t2.view(-1, 1, 1, 1)) * eps2 + t2.view(-1, 1, 1, 1) * tgt2
+            v_target2 = tgt2 - eps2
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                v_pred2 = model.get_velocity(z_t2, ctx2_aug, t2)
+                w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=200.0)
+                loss_ms = (((v_pred2 - v_target2) ** 2).mean(dim=(1, 2, 3)) * w2).mean().float()
+            loss = loss + loss_ms
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
