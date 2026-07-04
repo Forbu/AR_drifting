@@ -1,15 +1,16 @@
 # Ideas backlog (deferred / future)
 
 ## High-value, not yet tried on this benchmark
-- **Selffeed with gradient** (truncated BPTT through the surrogate step) instead of
-  detach: lets the model learn to *correct* its errors, not just tolerate them.
-  More expensive; may help sharpness. UNTESTED. (Note: reasoned that detach is
-  correct for the input-context surrogate, but BPTT through the multi-step LOSS
-  is different and untested.)
+- ~~Selffeed with gradient (BPTT)~~: WORSE. Tested as selffeed_ms_grad (gradient
+  through the multi-step loss pred): ED 690->950, sharpness 0.91->0.75 (mode
+  collapse - model rewarded for 'easy-to-predict-from' outputs). DESIGN
+  PRINCIPLE: DETACH the model's own predictions in both input-context selffeed
+  AND the multi-step rollout loss. Detached = trains robustness; gradient = collapse.
 - ~~3-step rollout loss~~: WORSE (ED 690->870, slower). 2-step is the sweet spot;
   deeper compounding adds noise.
 - **Restart / renoise during ODE sampling** (stochastic sampler) at each AR step —
-  sampling-side mechanism, orthogonal to training aug. UNTESTED.
+  sampling-side mechanism, orthogonal to training aug. UNTESTED (likely marginal:
+  within-sample quality isn't the bottleneck; context drift is, already addressed).
 - **Classifier-free guidance** on the context (drop context w.p. during training,
   guide at inference). UNTESTED.
 

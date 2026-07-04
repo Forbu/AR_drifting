@@ -103,6 +103,14 @@ This is the 2D-image analog of the hypersphere `decoupled-uncond` result
 structured data the *best* degraded conditions are the model's own predictions,
 not synthetic noise.
 
+**Design principle (empirically validated): DETACH the model's own predictions**
+in both the input-context self-feed and the multi-step rollout loss. Letting
+gradient flow (BPTT, `selffeed_ms_grad`) made things worse — ED 690→950,
+sharpness 0.91→0.75 — because it rewards "easy-to-predict-from" (degenerate /
+blurry) outputs (partial mode collapse). The detached formulation decouples the
+objective: the model is trained to *tolerate* imperfect context, not to *game*
+the next-step loss.
+
 ---
 
 ## Actionable takeaways for the weather model
