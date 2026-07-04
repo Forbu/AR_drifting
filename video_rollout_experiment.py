@@ -104,6 +104,7 @@ TECHNIQUE       = os.environ.get("TECHNIQUE", "pixnoise")
 SIGMA           = _env("SIGMA", 0.40, float)     # pixel-noise std
 BLUR_SIGMA      = _env("BLUR_SIGMA", 1.2, float) # 2D gaussian blur std
 SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
+SELFFEED_GATE   = _env("SELFFEED_GATE", 0.0, float)   # >0: error-gate self-feed (quantile kept, e.g. 0.5=keep low-error half)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
@@ -475,7 +476,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
         scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
         return blurred * scale
 
-    if TECHNIQUE in ("selffeed", "selffeed_m", "selffeed_ms"):
+    if TECHNIQUE in ("selffeed", "selffeed_m", "selffeed_ms", "selffeed_msgate"):
         # scheduled sampling: w.p. SELFFEED_PROB replace LAST context frame with
         # the model's own 1-step forecast from [extra, ctx[:,0]] (detached).
         out = ctx.clone()
@@ -485,9 +486,20 @@ def augment_context(ctx, model=None, extra=None, training=True):
                 sur_ctx = torch.stack([extra[mask], ctx[mask, 0]], dim=1)  # Bm,K,C,H,W
                 with torch.no_grad():
                     pred = sample_step(model, sur_ctx, ODE_STEPS, guidance=1.0)
-                out[mask, 1] = pred
+                # ERROR GATING: only self-feed samples whose surrogate prediction
+                # is accurate enough (low MSE vs the real frame). Adaptively
+                # self-feeds on easy/sparse data (good preds) and skips on
+                # hard/dense data (bad preds) -> works across regimes.
+                if SELFFEED_GATE > 0:
+                    real = ctx[mask, 1]
+                    err = ((pred - real) ** 2).mean(dim=(1, 2, 3))
+                    keep = err <= torch.quantile(err, SELFFEED_GATE)
+                    midx = mask.nonzero(as_tuple=True)[0][keep]
+                    out[midx, 1] = pred[keep]
+                else:
+                    out[mask, 1] = pred
         blurred = _blur2d(out, BLUR_SIGMA * 0.4)
-        if TECHNIQUE in ("selffeed_m", "selffeed_ms"):
+        if TECHNIQUE in ("selffeed_m", "selffeed_ms", "selffeed_msgate"):
             # manifold perturbation: + on-manifold amplitude jitter (keeps sharpness)
             scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
             return blurred * scale
@@ -559,7 +571,7 @@ def train(data):
             loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
         # multi-step rollout loss: predict tgt2 from [ctx[:,1], model_pred(tgt)],
         # training the model to stay consistent when its own output is fed back.
-        if TECHNIQUE == "selffeed_ms" and MS_PROB > 0 and rng.rand() < MS_PROB:
+        if TECHNIQUE in ("selffeed_ms", "selffeed_msgate") and MS_PROB > 0 and rng.rand() < MS_PROB:
             with torch.no_grad():
                 pred1 = sample_step(model, ctx, ODE_STEPS, guidance=1.0)  # model's pred of tgt from CLEAN ctx (matches inference)
             ctx2 = torch.stack([ctx[:, 1], pred1], dim=1)   # B,K,C,H,W
