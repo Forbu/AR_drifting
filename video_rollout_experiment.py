@@ -104,7 +104,8 @@ TECHNIQUE       = os.environ.get("TECHNIQUE", "pixnoise")
 SIGMA           = _env("SIGMA", 0.40, float)     # pixel-noise std
 BLUR_SIGMA      = _env("BLUR_SIGMA", 1.2, float) # 2D gaussian blur std
 SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
-SELFFEED_GATE   = _env("SELFFEED_GATE", 0.0, float)   # >0: error-gate self-feed (quantile kept, e.g. 0.5=keep low-error half)
+SELFFEED_GATE   = _env("SELFFEED_GATE", 0.0, float)   # >0: error-gate self-feed (relative quantile kept, e.g. 0.5=keep low-error half)
+SELFFEED_GATE_ABS = _env("SELFFEED_GATE_ABS", 0.0, float)  # >0: ABSOLUTE gate - keep if surrogate err < this * frame_variance (scale-invariant, regime-aware)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
@@ -490,10 +491,16 @@ def augment_context(ctx, model=None, extra=None, training=True):
                 # is accurate enough (low MSE vs the real frame). Adaptively
                 # self-feeds on easy/sparse data (good preds) and skips on
                 # hard/dense data (bad preds) -> works across regimes.
-                if SELFFEED_GATE > 0:
+                if SELFFEED_GATE > 0 or SELFFEED_GATE_ABS > 0:
                     real = ctx[mask, 1]
                     err = ((pred - real) ** 2).mean(dim=(1, 2, 3))
-                    keep = err <= torch.quantile(err, SELFFEED_GATE)
+                    if SELFFEED_GATE_ABS > 0:
+                        # absolute, scale-invariant: err / frame_variance.
+                        # sparse data + good pred -> tiny -> kept; dense/hard -> err~var -> dropped.
+                        var = real.var(dim=(1, 2, 3)).clamp(min=1e-6)
+                        keep = (err / var) <= SELFFEED_GATE_ABS
+                    else:
+                        keep = err <= torch.quantile(err, SELFFEED_GATE)
                     midx = mask.nonzero(as_tuple=True)[0][keep]
                     out[midx, 1] = pred[keep]
                 else:
