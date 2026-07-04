@@ -407,7 +407,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
         blurred = _blur2d(ctx, float(sb.mean()))
         return blurred + torch.randn_like(ctx) * (SIGMA * 0.5)
 
-    if TECHNIQUE in ("vae_noise", "vae_noise_blur"):
+    if TECHNIQUE in ("vae_noise", "vae_noise_blur", "vae_noise_blurj"):
         # VAE/AE-latent context corruption: encode -> add latent noise -> decode.
         # On-manifold "drifted" frames without model self-outputs (self-feed substitute).
         if _VAE is None:
@@ -415,8 +415,12 @@ def augment_context(ctx, model=None, extra=None, training=True):
         vae, lstd, _ = _VAE
         s = torch.sigmoid(1.0 + 1.8 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1-1e-3) * VAE_NOISE
         corrupted = vae_perturb(vae, ctx, float(s.mean()), lstd)
-        if TECHNIQUE == "vae_noise_blur":
+        if TECHNIQUE in ("vae_noise_blur", "vae_noise_blurj"):
             corrupted = _blur2d(corrupted, BLUR_SIGMA * 0.4)
+        if TECHNIQUE == "vae_noise_blurj":
+            # on-manifold amplitude jitter (keeps sharpness, like selffeed_m)
+            scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
+            corrupted = corrupted * scale
         return corrupted
 
     if TECHNIQUE == "manifold_noise":
