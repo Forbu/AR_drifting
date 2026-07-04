@@ -158,8 +158,12 @@ Results (deterministic, TRAIN_STEPS=2000):
 | **VAE (β=1e-3) latent noise** | **12712** | **0.22** | **FAILS — worse than pixnoise!** |
 | manifold_noise (blur+jitter) | 2142 | 1.26 | artifacty |
 | AE (β≈1e-5) latent noise | 2113 | 0.77 | sharp AE works |
-| **AE latent noise + mild blur** | **1186** | **0.93** | **best no-self-feed (5.7× pixnoise)** |
+| AE latent-interp + blur | 1268 | 1.18 | two-blob blends, artifacty |
+| **AE latent-noise + mild blur (σ_n=0.2)** | **1186** | **0.93** | **best no-self-feed (5.7× pixnoise)** |
 | selffeed_ms (needs self-outputs) | 690 | 0.91 | champion |
+
+VAE_NOISE sweep for the winner: 0.1→1600, **0.2→1186 (optimum)**, 0.3→2112
+(sharp valley). Adding amplitude jitter on top *hurt* (over-corruption, 2077).
 
 **Critical principle: the corruption MUST stay sharp.** A normal VAE (KL>0)
 blurs its reconstruction AND its decoder regresses perturbed latents to the data
