@@ -207,7 +207,7 @@ class VideoSequenceData:
                     for b, et in enumerate(extra):
                         c2 = (np.array([[0.9, 0.2, -0.1], [0.1, 0.8, 0.2]]) * (b + 1) @ et[i])
                         c2 = np.clip(c2 * (img * 0.18) + img * 0.5, 1.5, img - 1.5)
-                        ct2 = torch.tensor(c2, dtype=torch.float32, device=DEVICE)
+                        ct2 = torch.tensor(c2.reshape(1, 2), dtype=torch.float32, device=DEVICE)
                         ap2 = torch.tensor([0.7 - 0.1 * b], dtype=torch.float32, device=DEVICE)
                         frame[0] = frame[0] + renderer.render(ct2, ap2, blob_sigma)[0]
                     frame = frame.clamp(max=1.5)
