@@ -198,6 +198,35 @@ encode -> +small latent noise -> decode -> +mild blur. This is the best
 self-feed-free option found (5.7× better than pixel noise), though ~1.7× worse
 than true scheduled sampling (which remains preferable wherever feasible).
 
+## Regime dependence: data STRUCTURE matters (important for weather)
+
+The self-feed recommendation is **regime-specific**. Tested on multi-feature data
+(N_BLOBS=2: 3 independently-moving blobs, simulating dense/complex fields):
+
+| Technique | sparse (single blob) | dense (3 blobs) |
+|---|---|---|
+| no augmentation | 5940 | **1563** ✅ |
+| pixel noise | 6746 | 1751 |
+| selffeed_ms | **690** ✅ | 2691 |
+
+On **sparse-feature** data self-feed helps ~9×; on **dense-feature** data
+augmentation of any kind *hurts* and no-aug is best. Two reasons:
+1. Pixel-noise's catastrophic-blur failure only happens when the data **mean is
+   degenerate** (sparse features → mean is blank). Dense data's mean looks like
+   valid data, so pixel noise is harmless there.
+2. Self-feed's "train on your own errors" needs decent per-step predictions. On
+   hard/dense tasks the surrogate is poor → it feeds the model bad contexts →
+   worse (train_loss 0.08 sparse → 0.32 dense).
+
+**Implication for weather:** match the technique to the regime.
+- **Sparse / isolated features** (convective cells, lightning, clear-air) → the
+  user's stated "blurry cells" failure mode → **self-feed wins** (this is the
+  regime the recommendation targets).
+- **Dense / widespread** (stratiform precipitation, overcast) → augmentation is
+  unnecessary and may hurt; a clean-condition model is already stable.
+Mixing regimes (real radar has both) likely benefits from self-feed applied
+*conditionally* (only when the context is sparse) — untested.
+
 ## Caveats / not overfitting
 
 - Validated on a *single-blob Lorenz* dataset. The mechanism (exposure-bias fix)
