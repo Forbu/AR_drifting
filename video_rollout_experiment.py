@@ -327,7 +327,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
         scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
         return blurred * scale
 
-    if TECHNIQUE == "selffeed":
+    if TECHNIQUE in ("selffeed", "selffeed_m"):
         # scheduled sampling: w.p. SELFFEED_PROB replace LAST context frame with
         # the model's own 1-step forecast from [extra, ctx[:,0]] (detached).
         out = ctx.clone()
@@ -338,7 +338,12 @@ def augment_context(ctx, model=None, extra=None, training=True):
                 with torch.no_grad():
                     pred = sample_step(model, sur_ctx, ODE_STEPS)
                 out[mask, 1] = pred
-        return _blur2d(out, BLUR_SIGMA * 0.4)
+        blurred = _blur2d(out, BLUR_SIGMA * 0.4)
+        if TECHNIQUE == "selffeed_m":
+            # manifold perturbation: + on-manifold amplitude jitter (keeps sharpness)
+            scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
+            return blurred * scale
+        return blurred
 
     if TECHNIQUE == "diff_forcing":
         out = ctx.clone()
