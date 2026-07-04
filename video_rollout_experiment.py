@@ -474,6 +474,26 @@ def mmd2_sq(a, b, bw):
     return float((maa + mbb - 2 * mab).clamp(min=0.0))
 
 
+def energy_distance(a, b):
+    """Non-saturating energy distance (V-statistic) in standardized feature space.
+    ED = 2 E||X-Y|| - E||X-X'|| - E||Y-Y'||  >= 0, =0 iff distributions match.
+    Unlike Gaussian-kernel MMD it grows with distributional distance instead of
+    saturating at ~1 when the rollout is catastrophically off-manifold."""
+    na, nb = a.shape[0], b.shape[0]
+    D_ab = torch.cdist(a, b).mean()
+    if na > 1:
+        D_aa = torch.cdist(a, a)
+        D_aa = D_aa[torch.triu_indices(na, na, 1).unbind()].mean()
+    else:
+        D_aa = torch.zeros((), device=a.device)
+    if nb > 1:
+        D_bb = torch.cdist(b, b)
+        D_bb = D_bb[torch.triu_indices(nb, nb, 1).unbind()].mean()
+    else:
+        D_bb = torch.zeros((), device=a.device)
+    return float((2 * D_ab - D_aa - D_bb).clamp(min=0.0))
+
+
 def raw_grad_mass(frames):
     gx, gy = torch.gradient(frames, dim=(2, 3))
     ge = float((gx ** 2 + gy ** 2).mean())
@@ -482,16 +502,22 @@ def raw_grad_mass(frames):
 
 
 def evaluate(model, data, ref_feats, ref_stats, bw, ref_grad, ref_mass):
-    rollout_frames = rollout(model, data, N_ROLLOUT, ROLLOUT_LEN)
-    rf = rollout_frames.flatten(0, 1)[:1024]  # (T*B, C, H, W)
-    rf_feat = features(rf)
+    rollout_frames = rollout(model, data, N_ROLLOUT, ROLLOUT_LEN)  # T,B,C,H,W
+    flat = rollout_frames.flatten(0, 1)            # (T*B, C,H,W)
+    rf = flat[:1024]
     mu, sd = ref_stats
-    rf_feat = (rf_feat - mu) / sd
+    rf_feat = (features(rf) - mu) / sd
+    ed = energy_distance(rf_feat, ref_feats)
     mmd = mmd2_sq(rf_feat, ref_feats, bw)
+    # late-half energy distance (where drift is worst) — diagnostic
+    half = rollout_frames.shape[0] // 2
+    late = rollout_frames[half:].flatten(0, 1)[:1024]
+    late_feat = (features(late) - mu) / sd
+    ed_late = energy_distance(late_feat, ref_feats)
     ge_roll, mass_roll = raw_grad_mass(rf)
     sharp = ge_roll / max(ref_grad, 1e-9)
     mass_drift = abs(mass_roll - ref_mass) / max(abs(ref_mass), 1e-9)
-    return mmd, sharp, mass_drift
+    return ed, mmd, ed_late, sharp, mass_drift
 
 
 # --------------------------------------------------------------------------- #
@@ -524,23 +550,27 @@ def main():
     fidx = np.random.RandomState(SEED + 11).choice(train_data.N, 512, replace=False)
     floor_feat = (features(train_data.frames[fidx]) - mu) / sd
     mmd_floor = mmd2_sq(floor_feat, ref_f, bw)
-    print(f"[data] ref feats={ref_f.shape} bw={bw:.3f} mmd_floor={mmd_floor:.6f} "
-          f"ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
+    ed_floor = energy_distance(floor_feat, ref_f)
+    print(f"[data] ref feats={ref_f.shape} bw={bw:.3f} ed_floor={ed_floor:.6f} "
+          f"mmd_floor={mmd_floor:.6f} ref_grad={ref_grad:.5f} ref_mass={ref_mass:.5f}", flush=True)
 
     print(f"[train] {TRAIN_STEPS} steps batch={BATCH}", flush=True)
     model, train_loss = train(train_data)
 
     print("[eval] rollout...", flush=True)
-    mmd, sharp, mass_drift = evaluate(model, hold_data, ref_f, (mu, sd), bw, ref_grad, ref_mass)
+    ed, mmd, ed_late, sharp, mass_drift = evaluate(model, hold_data, ref_f, (mu, sd), bw, ref_grad, ref_mass)
     wall = time.time() - t0
 
-    print(f"[done] rollout_mmd={mmd:.6f} sharpness={sharp:.4f} mass_drift={mass_drift:.4f} "
-          f"train_loss={train_loss:.5f} mmd_floor={mmd_floor:.6f} wall={wall:.1f}s", flush=True)
-    print(f"METRIC rollout_mmd={mmd:.6f}", flush=True)
+    print(f"[done] rollout_ed={ed:.6f} ed_late={ed_late:.6f} mmd={mmd:.6f} "
+          f"sharpness={sharp:.4f} mass_drift={mass_drift:.4f} "
+          f"train_loss={train_loss:.5f} ed_floor={ed_floor:.6f} wall={wall:.1f}s", flush=True)
+    print(f"METRIC rollout_ed={ed:.6f}", flush=True)
+    print(f"METRIC ed_late={ed_late:.6f}", flush=True)
+    print(f"METRIC mmd={mmd:.6f}", flush=True)
     print(f"METRIC sharpness_ratio={sharp:.6f}", flush=True)
     print(f"METRIC mass_drift={mass_drift:.6f}", flush=True)
     print(f"METRIC train_loss={train_loss:.6f}", flush=True)
-    print(f"METRIC mmd_floor={mmd_floor:.6f}", flush=True)
+    print(f"METRIC ed_floor={ed_floor:.6f}", flush=True)
     print(f"METRIC wall_s={wall:.2f}", flush=True)
 
 
