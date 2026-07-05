@@ -107,6 +107,9 @@ SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
 SELFFEED_GATE   = _env("SELFFEED_GATE", 0.0, float)   # >0: error-gate self-feed (relative quantile kept, e.g. 0.5=keep low-error half)
 SELFFEED_GATE_ABS = _env("SELFFEED_GATE_ABS", 0.0, float)  # >0: ABSOLUTE gate - keep if surrogate err < this * frame_variance (scale-invariant, regime-aware)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
+MANIFOLD_BLUR_FRAC = _env("MANIFOLD_BLUR_FRAC", 0.6, float)  # manifold_noise: blur = BLUR_SIGMA * this
+MANIFOLD_JITTER  = _env("MANIFOLD_JITTER", 0.08, float)      # manifold_noise: amplitude jitter std
+MANIFOLD_BLUR_RAND = _env("MANIFOLD_BLUR_RAND", 0.5, float)  # manifold_noise: per-sample blur uniform jitter (0=fixed)
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 # VAE/AE-latent context corruption (simulates rollout drift without model self-outputs)
@@ -471,10 +474,15 @@ def augment_context(ctx, model=None, extra=None, training=True):
         return corrupted
 
     if TECHNIQUE == "manifold_noise":
-        # manifold-aligned-ish: mild blur (smooth, plausible) + amplitude jitter
-        sb = BLUR_SIGMA * 0.6 * (0.5 + torch.rand(B, 1, 1, 1, 1, device=ctx.device))
+        # manifold-aligned-ish: mild blur (smooth, plausible) + amplitude jitter.
+        # Emulates the model's actual rollout error (wider, lower-amp blob).
+        base_sb = BLUR_SIGMA * MANIFOLD_BLUR_FRAC
+        if MANIFOLD_BLUR_RAND > 0:
+            sb = base_sb * (1.0 - MANIFOLD_BLUR_RAND + 2.0 * MANIFOLD_BLUR_RAND * torch.rand(B, 1, 1, 1, 1, device=ctx.device))
+        else:
+            sb = base_sb
         blurred = _blur2d(ctx, float(sb.mean()))
-        scale = 1.0 + 0.08 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
+        scale = 1.0 + MANIFOLD_JITTER * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
         return blurred * scale
 
     if TECHNIQUE in ("selffeed", "selffeed_m", "selffeed_ms", "selffeed_msgate"):
