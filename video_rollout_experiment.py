@@ -97,6 +97,7 @@ BATCH           = _env("BATCH", 96, int)
 LR              = _env("LR", 2e-3, float)
 GRAD_CLIP       = _env("GRAD_CLIP", 1.0, float)    # max grad norm (ViT/jit3d needs tighter, e.g. 0.5, vs conv default 1.0)
 AMP             = _env("AMP", 1, int)            # 1=bf16 autocast (fast); 0=fp32 (stable for jit3d, which diverges under bf16+200x loss weight)
+RF_WCLAMP       = _env("RF_WCLAMP", 200.0, float)  # clamp on the 1/(1-t)^2 RF velocity loss weight; lower (e.g. 50) trades high-t emphasis for ViT optimization stability
 WARMUP_STEPS    = _env("WARMUP_STEPS", 0, int)    # linear LR warmup (helps ViT/jit3d optimization stability); 0 = off (cosine from full LR)
 ODE_STEPS       = _env("ODE_STEPS", 16, int)     # Euler substeps for sampling
 ARCH            = os.environ.get("ARCH", "conv2d")   # conv2d (channel-concat) | conv3d (3D-conv context encoder) | jit3d (production JiT-3D ViT)
@@ -799,7 +800,7 @@ def train(data):
         with _amp():
             v_pred = model.get_velocity(z_t, ctx_aug, t)
             # inverse-conditional-variance weight 1/(1-t)^2 clamped (RF x-pred)
-            w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=200.0)
+            w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
             loss_vel = ((v_pred - v_target) ** 2).mean(dim=(1, 2, 3)) * w
             x_pred = model.forward(z_t, ctx_aug, t)
             loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
@@ -837,7 +838,7 @@ def train(data):
             v_target2 = tgt2 - eps2
             with _amp():
                 v_pred2 = model.get_velocity(z_t2, ctx2_aug, t2)
-                w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=200.0)
+                w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
                 loss_ms = (((v_pred2 - v_target2) ** 2).mean(dim=(1, 2, 3)) * w2).mean().float()
             loss = loss + MS_WEIGHT * loss_ms
         opt.zero_grad()

@@ -109,3 +109,43 @@ self-feed is strong AND live self-feed is impractical. Kept here for reference.
   3 future-frame predictions during training; bank those, use to corrupt context.
 - Variant: weight recent bank entries (model improves over time).
 - Risk: bank lag (stale predictions); cheap high-t x_pred may be too noisy.
+
+## 2026-07-05 session: JiT-3D production architecture + latent-noise corruption
+Full writeup: JIT3D_FINDINGS.md. Summary:
+
+### ANSWERED (do not retry on this benchmark)
+- ~~Latent-noise corruption (production LatentContextCorruptor) on jit3d~~: FAILS.
+  Monotonic collapse to blur (sharp 0.10->0.075 as corruption grows). Mechanism:
+  context-token noise makes the UNDERTRAINED ViT ignore context -> mean
+  regression. ED appears to improve but it's a metric-gaming artifact (blurry
+  frames' pooled features regress to the reference mean); sharpness+mass_drift
+  tell the truth. Trust sharpness, not ED, for the ViT.
+- ~~bigger jit3d via more TRAIN_STEPS~~: DEGRADES past ~3000 steps (loss 0.42->1.28
+  @4000). The t~=0 200x loss-weight instability accumulates. "Train more" doesn't
+  help this ViT here.
+
+### CRITICAL training fixes (infrastructure, committed)
+- jit3d REQUIRES fp32 (AMP=0): bf16 diverges under the 1/(1-t)^2 RF loss.
+- LR 1e-4 stable; 2e-4 knife-edge; 4e-4 diverge. grad_clip must stay 1.0 (0.5
+  causes Adam amplification). NO warmup (peak-LR hold worsens divergence).
+
+### BEST jit3d config on this benchmark
+- manifold_noise (INPUT-space aug) LAST_ONLY jitter=0.20 blur_frac=0.5,
+  3000 steps fp32, SAMPLE_AVG=4: sharp 0.32, mass_drift 0.002. Real forecast
+  quality (sharp, correct mass) but high ED from positional divergence (chaos).
+
+### Transferable to production (the user's real model)
+- The corruption magnitude MUST be validated on a WELL-TRAINED checkpoint on real
+  data. It fails here only because the ViT is undertrained on 220 trajectories.
+  Failure mode to watch in production: blur collapse via context-downweighting.
+  Monitor rollout sharpness + mass/energy drift, not only distributional ED.
+- Consider input-space context aug (blur + amplitude jitter) as a robustness-
+  friendly complement to the latent corruptor.
+- Use fp32 (or loss-scaled mixed precision) for this ViT + RF-velocity loss.
+
+### Untried (low priority, weak prior now)
+- Latent corruption at a DEEP stage only (not embed) on a well-trained checkpoint
+  — could avoid the context-ignoring collapse. Needs a way to train the ViT
+  better first (more data, not more steps).
+- A larger patch (JIT_PATCH_HW=8) to cut token count and overfitting — may let the
+  ViT train better on tiny data. Not tested.
