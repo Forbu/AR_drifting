@@ -99,14 +99,12 @@ spikes to 5.48). mmd stuck at 0.404 ceiling (saturated, useless).
   OVERCORRUPTS there (15898 > none). The optimal magnitude is DATA-SCALE
   DEPENDENT — must light-tune per dataset. Conservative jitter=0.16 more robust.
 
-### TOP UNTRIED IDEA: snapshot/bank "pseudo-self-feed" (most promising)
-Close the compounding gap WITHOUT live self-feed: maintain a FIFO bank of the
-model's own predictions (collected cheaply during training — e.g. from x_pred at
-high-t, or a periodic full-ODE sample every N steps), and use bank samples
-(blended with the real last-context-frame + mild blur) as the corruption for the
-last context slot. This captures the model's ACTUAL current error distribution
-(its specific blur/amp pattern) and UPDATES as the model improves -> approximate
-self-feed compounding, without per-batch live sampling.
+### TOP UNTRIED IDEA: snapshot/bank "pseudo-self-feed" ~~(most promising)~~
+~~Close the compounding gap WITHOUT live self-feed~~ — DEPRIORITIZED: in the
+current env live self-feed UNDERPERFORMS (1284 vs manifold_noise 630), so there is
+no gap to close. The bank idea (bank the model's training-time predictions, use
+as context corruption) is only worth revisiting if moving to a regime where
+self-feed is strong AND live self-feed is impractical. Kept here for reference.
 - Applicable to the user's 4ctx->3fut weather model: their model already produces
   3 future-frame predictions during training; bank those, use to corrupt context.
 - Variant: weight recent bank entries (model improves over time).

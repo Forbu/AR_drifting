@@ -96,6 +96,11 @@ TRAIN_STEPS     = _env("TRAIN_STEPS", 2000, int)
 BATCH           = _env("BATCH", 96, int)
 LR              = _env("LR", 2e-3, float)
 ODE_STEPS       = _env("ODE_STEPS", 16, int)     # Euler substeps for sampling
+ARCH            = os.environ.get("ARCH", "conv2d")   # conv2d (channel-concat) | conv3d (3D-conv context encoder + in-network latent blur)
+LATENT_BLUR     = _env("LATENT_BLUR", 0.0, float)    # ARCH=conv3d: sigma for blurring the CONTEXT LATENT in feature space (inside the net) during training
+MODEL_CH        = _env("MODEL_CH", 48, int)       # conv channel width of the forecaster
+MODEL_BLOCKS    = _env("MODEL_BLOCKS", 4, int)     # number of conv blocks
+NOISE_INJECT    = _env("NOISE_INJECT", 0.0, float)    # >0: stochastic RF sampler - re-noise z during ODE proportional to remaining noise level (regularizes deterministic drift)
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -304,6 +309,84 @@ class VideoRF(nn.Module):
             x = blk(x, temb)
         x = self.out_act(self.out_norm(x))
         return self.out_conv(x)  # x_pred (B,C,H,W)
+
+    def get_velocity(self, z_t, ctx, t):
+        x_pred = self.forward(z_t, ctx, t)
+        return (x_pred - z_t) / (1.0 - t).clamp(min=0.01).view(-1, 1, 1, 1)
+
+
+# --------------------------------------------------------------------------- #
+# 2a-alt. VideoRF3D — 3D-conv CONTEXT ENCODER + in-network CONTEXT-LATENT BLUR
+#   Treats the K context frames as an explicit temporal volume (3D conv over
+#   time x H x W) instead of flattening them into channels. This yields a
+#   distinct CONTEXT LATENT volume that can be blurred IN FEATURE SPACE (inside
+#   the network) to emulate rollout drift on high-level features rather than raw
+#   pixels. Applicable to the user's weather model (4 ctx frames -> 3D conv).
+# --------------------------------------------------------------------------- #
+class Conv3dBlock(nn.Module):
+    def __init__(self, ch, groups=4):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(groups, ch)
+        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, ch)
+        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.act = nn.SiLU()
+    def forward(self, x):
+        x = x + self.conv1(self.act(self.norm1(x)))
+        x = x + self.conv2(self.act(self.norm2(x)))
+        return x
+
+
+class VideoRF3D(nn.Module):
+    """3D-conv context encoder + 2D FiLM decoder. The context latent volume can
+    be blurred in feature space during training (latent_blur_sigma>0)."""
+    def __init__(self, k_ctx, c_chan, ch=48, tdim=64, n_blocks=4, latent_blur_sigma=0.0):
+        super().__init__()
+        self.k_ctx = k_ctx
+        self.c_chan = c_chan
+        self.ch = ch
+        self.latent_blur_sigma = latent_blur_sigma
+        # context encoder: input (B, C, K, H, W) -> latent (B, ch, K, H, W)
+        self.ctx_stem = nn.Conv3d(c_chan, ch, 3, padding=1)
+        self.ctx_blocks = nn.ModuleList([Conv3dBlock(ch) for _ in range(2)])
+        # collapse the temporal axis K -> 1 (let the net learn how to fuse frames)
+        self.ctx_merge = nn.Conv3d(ch, ch, kernel_size=(k_ctx, 1, 1))
+        # z path
+        self.z_stem = nn.Conv2d(c_chan, ch, 3, padding=1)
+        # fuse context + z features
+        self.fuse = nn.Conv2d(ch * 2, ch, 3, padding=1)
+        # 2D FiLM decoder (reuses ConvBlock)
+        self.blocks = nn.ModuleList([ConvBlock(ch, tdim) for _ in range(n_blocks)])
+        self.temb = SinTime(tdim)
+        self.tmlp = nn.Sequential(nn.Linear(tdim, tdim), nn.SiLU(), nn.Linear(tdim, tdim))
+        self.out_norm = nn.GroupNorm(4, ch)
+        self.out_conv = nn.Conv2d(ch, c_chan, 3, padding=1)
+        self.out_act = nn.SiLU()
+
+    def _blur_latent(self, feat):
+        # feat: (B, ch, K, H, W) -> 2D Gaussian blur per (ch,K) slice, in feature space
+        B, C, K, H, W = feat.shape
+        flat = feat.reshape(B * C * K, 1, H, W)
+        bl = _blur2d(flat, self.latent_blur_sigma)
+        return bl.reshape(B, C, K, H, W)
+
+    def forward(self, z_t, ctx, t):
+        # z_t: (B,C,H,W); ctx: (B,K,C,H,W); t: (B,)
+        temb = self.tmlp(self.temb(t))
+        ctx5 = ctx.permute(0, 2, 1, 3, 4).contiguous()  # B,C,K,H,W
+        h = self.ctx_stem(ctx5)
+        for blk in self.ctx_blocks:
+            h = blk(h)
+        if self.training and self.latent_blur_sigma > 0:
+            h = self._blur_latent(h)
+        h = self.ctx_merge(h)            # B,ch,1,H,W
+        ctx_feat = h.squeeze(2)          # B,ch,H,W
+        z_feat = self.z_stem(z_t)        # B,ch,H,W
+        x = self.fuse(torch.cat([ctx_feat, z_feat], dim=1))
+        for blk in self.blocks:
+            x = blk(x, temb)
+        x = self.out_act(self.out_norm(x))
+        return self.out_conv(x)
 
     def get_velocity(self, z_t, ctx, t):
         x_pred = self.forward(z_t, ctx, t)
@@ -573,7 +656,11 @@ def extra_loss(x_pred, y_target):
 # --------------------------------------------------------------------------- #
 def train(data):
     torch.manual_seed(SEED)
-    model = VideoRF(K_CTX, C_CHAN).to(DEVICE)
+    if ARCH == "conv3d":
+        model = VideoRF3D(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS,
+                          latent_blur_sigma=LATENT_BLUR).to(DEVICE)
+    else:
+        model = VideoRF(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     rng = np.random.RandomState(SEED + 1)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, TRAIN_STEPS)
@@ -668,6 +755,10 @@ def sample_step(model, ctx, n_ode, guidance=None):
                 v_u = model.get_velocity(z, torch.zeros_like(ctx_aug), t)
                 v = v_u + g * (v - v_u)
             z = z + v * dt
+            if NOISE_INJECT > 0:
+                # stochastic sampler: re-noise proportional to remaining noise level (1-(t+dt))
+                remaining = (1.0 - (i + 1) * dt).clamp(min=0.0)
+                z = z + NOISE_INJECT * math.sqrt(dt) * remaining * torch.randn_like(z)
     return z.float()
 
 
