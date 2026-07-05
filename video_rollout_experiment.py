@@ -96,10 +96,23 @@ TRAIN_STEPS     = _env("TRAIN_STEPS", 2000, int)
 BATCH           = _env("BATCH", 96, int)
 LR              = _env("LR", 2e-3, float)
 ODE_STEPS       = _env("ODE_STEPS", 16, int)     # Euler substeps for sampling
-ARCH            = os.environ.get("ARCH", "conv2d")   # conv2d (channel-concat) | conv3d (3D-conv context encoder + in-network latent blur)
+ARCH            = os.environ.get("ARCH", "conv2d")   # conv2d (channel-concat) | conv3d (3D-conv context encoder) | jit3d (production JiT-3D ViT)
 LATENT_BLUR     = _env("LATENT_BLUR", 0.0, float)    # ARCH=conv3d: sigma for blurring the CONTEXT LATENT in feature space (inside the net) during training
 MODEL_CH        = _env("MODEL_CH", 48, int)       # conv channel width of the forecaster
 MODEL_BLOCKS    = _env("MODEL_BLOCKS", 4, int)     # number of conv blocks
+# --- JiT-3D (production architecture) knobs; only used when ARCH=jit3d ---
+FLASHNET_PATH   = os.environ.get("FLASHNET_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "flashnet"))
+JIT_EMBED_DIM   = _env("JIT_EMBED_DIM", 128, int)   # ViT embedding dim (must be divisible by JIT_HEADS)
+JIT_DEPTH       = _env("JIT_DEPTH", 4, int)         # number of transformer blocks
+JIT_HEADS       = _env("JIT_HEADS", 4, int)          # attention heads
+JIT_PATCH_T     = _env("JIT_PATCH_T", 1, int)        # temporal patch size
+JIT_PATCH_HW    = _env("JIT_PATCH_HW", 4, int)       # spatial patch size (H=W)
+JIT_MLP_RATIO   = _env("JIT_MLP_RATIO", 2.6, float)  # SwiGLU hidden ratio
+# JiT-3D built-in latent-context corruptor (an ALTERNATIVE/COMPLEMENTARY aug to
+# augment_context; the autoresearch lever remains augment_context). Default off.
+JIT_CORRUPT_PROB   = _env("JIT_CORRUPT_PROB", 0.0, float)
+JIT_CORRUPT_EMBED  = _env("JIT_CORRUPT_EMBED", 0.10, float)
+JIT_CORRUPT_BLOCK0 = _env("JIT_CORRUPT_BLOCK0", 0.05, float)
 NOISE_INJECT    = _env("NOISE_INJECT", 0.0, float)    # >0: stochastic RF sampler - re-noise z during ODE proportional to remaining noise level (regularizes deterministic drift)
 SAMPLE_AVG      = _env("SAMPLE_AVG", 1, int)        # >1: average this many noise-sample predictions per AR rollout step (variance reduction -> less drift compounding)
 # rollout eval
@@ -395,6 +408,79 @@ class VideoRF3D(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# 2a-alt2. VideoRFJiT3D — production JiT-3D Vision Transformer.
+#   Wraps the actual production model
+#   (../flashnet/meteolibre_model/models/jit3d.py:JiT3D_Modern) behind the same
+#   (z_t, ctx, t) -> x_pred (B,C,H,W) interface as VideoRF/VideoRF3D, so the rest
+#   of the benchmark (training, sampling, rollout, metrics, augment_context) is
+#   unchanged. The K context frames + the noisy target z_t are stacked along the
+#   time axis into a (B, C, K+1, H, W) volume; the model predicts all frames and
+#   we keep only the last (target) frame. Carries the production model's built-in
+#   LatentContextCorruptor (controllable via JIT_CORRUPT_* env vars; off by
+#   default so augment_context remains the AR-stability lever).
+# --------------------------------------------------------------------------- #
+def _import_jit3d():
+    import sys as _sys
+    if _sys.path[0] != FLASHNET_PATH:
+        _sys.path.insert(0, FLASHNET_PATH)
+    from meteolibre_model.models.jit3d import JiT3D_Modern  # noqa: WPS433
+    return JiT3D_Modern
+
+
+class VideoRFJiT3D(nn.Module):
+    """Adapter: rectified-flow endpoint predictor backed by the production
+    JiT-3D ViT. Exposes forward(z_t, ctx, t) -> x_pred and get_velocity like the
+    conv backbones."""
+    def __init__(self, k_ctx, c_chan, img,
+                 embed_dim=128, depth=4, num_heads=4,
+                 patch_t=1, patch_hw=4, mlp_ratio=2.6,
+                 corrupt_prob=0.0, corrupt_embed=0.10, corrupt_block0=0.05):
+        super().__init__()
+        JiT3D_Modern = _import_jit3d()
+        self.k_ctx = k_ctx
+        self.c_chan = c_chan
+        T = k_ctx + 1  # K context frames + 1 noisy target frame
+        assert img % patch_hw == 0, f"IMG={img} must be divisible by JIT_PATCH_HW={patch_hw}"
+        assert T % patch_t == 0, f"T={T} must be divisible by JIT_PATCH_T={patch_t}"
+        assert embed_dim % num_heads == 0, "JIT_EMBED_DIM must be divisible by JIT_HEADS"
+        self.jit = JiT3D_Modern(
+            img_size=(T, img, img),
+            patch_size=(patch_t, patch_hw, patch_hw),
+            in_channels=c_chan,
+            out_channels=c_chan,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            context_dim=1,          # only the RF time scalar is passed as conditioning
+            time_emb_dim=64,
+            n_context_frames=k_ctx,
+            corruption_prob=corrupt_prob,
+            embed_noise_scale=corrupt_embed,
+            block0_noise_scale=corrupt_block0,
+        )
+        # patch the JiT block MLP ratio if a custom value was requested
+        if mlp_ratio != 2.6:
+            for blk in self.jit.blocks:
+                hidden = int(embed_dim * mlp_ratio)
+                blk.mlp = type(blk.mlp)(embed_dim, hidden, embed_dim)
+
+    def forward(self, z_t, ctx, t):
+        # z_t: (B,C,H,W); ctx: (B,K,C,H,W); t: (B,)
+        B = z_t.shape[0]
+        # stack [context frames ..., noisy target] along time -> (B, K+1, C, H, W)
+        vol_t = torch.cat([ctx, z_t.unsqueeze(1)], dim=1)
+        vol = vol_t.permute(0, 2, 1, 3, 4).contiguous()  # (B, C, T, H, W)
+        t_in = t.view(B, 1).float()                     # (B, 1) -> context_dim=1
+        out = self.jit(vol, t_in)                        # (B, C, T, H, W)
+        x_pred = out[:, :, self.k_ctx:, :, :]           # keep target slice
+        return x_pred.flatten(1, 2)                     # (B, C, H, W)
+
+    def get_velocity(self, z_t, ctx, t):
+        x_pred = self.forward(z_t, ctx, t)
+        return (x_pred - z_t) / (1.0 - t).clamp(min=0.01).view(-1, 1, 1, 1)
+
+
+# --------------------------------------------------------------------------- #
 # 2b. VAE/AE CORRUPTOR — learns the data manifold, then corrupts context frames
 #     via encode -> add latent noise -> decode. Produces on-manifold "drifted"
 #     frames WITHOUT needing the model's own outputs or extra data (the
@@ -660,6 +746,14 @@ def train(data):
     if ARCH == "conv3d":
         model = VideoRF3D(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS,
                           latent_blur_sigma=LATENT_BLUR).to(DEVICE)
+    elif ARCH == "jit3d":
+        model = VideoRFJiT3D(
+            K_CTX, C_CHAN, IMG,
+            embed_dim=JIT_EMBED_DIM, depth=JIT_DEPTH, num_heads=JIT_HEADS,
+            patch_t=JIT_PATCH_T, patch_hw=JIT_PATCH_HW, mlp_ratio=JIT_MLP_RATIO,
+            corrupt_prob=JIT_CORRUPT_PROB, corrupt_embed=JIT_CORRUPT_EMBED,
+            corrupt_block0=JIT_CORRUPT_BLOCK0,
+        ).to(DEVICE)
     else:
         model = VideoRF(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
@@ -885,7 +979,7 @@ def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     print(f"TECHNIQUE={TECHNIQUE} SIGMA={SIGMA} BLUR_SIGMA={BLUR_SIGMA} "
-          f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} device={DEVICE}", flush=True)
+          f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} ARCH={ARCH} device={DEVICE}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,
