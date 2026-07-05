@@ -173,3 +173,29 @@ REMAINING (low prior on THIS benchmark; the gap is data/architecture, not aug):
   the failure mode to monitor is blur-collapse via context-downweighting early in
   training. Keep defaults, tune PROB on the ED/sharpness Pareto (0.3=sharp 0.23,
   0.5=low-ED 0.19).
+
+## 2026-07-05 RF_WCLAMP breakthrough + full lever characterization (41 experiments)
+Headline: the dominant lever for the ViT was the RF loss-weight clamp
+(RF_WCLAMP), NOT the corruption. Default 200 catastrophic; optimum ~6.
+
+### CONFIRMED OPTIMA (robust, cross-seed)
+- **RF_WCLAMP=6** (THE lever): ViT 45x->2.7x behind conv. Sweep: 200 diverge,
+  100 collapse, 50->21636/0.21, 25->7224/0.49, 12->3909/0.65, **6->1470/0.83**,
+  3->3449 (reverses). Verified SEED=0 AND SEED=2. Principle: clamp over-emphasizes
+  easy t~=1 denoising; lowering shifts weight to t~=0 forecasting direction.
+- AMP=0 (fp32): required, bf16 diverges.
+- SAMPLE_AVG=4: free 17%, cross-seed. AVG8 ghosts (worse).
+- ODE_STEPS=32: optimal (48 regresses - chaos amplification; same as conv).
+- TRAIN_STEPS 3000-4500: longer now viable (WCLAMP=6 stabilizes); seed-dependent
+  sharpness tradeoff (~3000 robust default, 4500 squeezes ED).
+
+### CLOSED NEGATIVES (do not retry)
+- Latent corruption: hurts in ALL regimes (undertrained=collapse; WCLAMP50=seed-
+  brittle; WCLAMP6=hurts every metric). Definitively not worth it.
+- manifold_noise (input aug): worse than no-aug on ViT ED (positional divergence).
+- grad_clip 0.5, warmup: both poisonous (Adam amplification / peak-LR hold).
+
+### REMAINING (architectural, not aug-addressable)
+- ViT ED 1210 (S0) vs conv 451 - 2.7x gap is data-scale/inductive-bias (ViT must
+  learn Lorenz dynamics from 220 traj; conv's locality is ideal). Closes with
+  production-scale data, not tricks.
