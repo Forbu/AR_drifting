@@ -110,6 +110,8 @@ SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 MANIFOLD_BLUR_FRAC = _env("MANIFOLD_BLUR_FRAC", 0.6, float)  # manifold_noise: blur = BLUR_SIGMA * this
 MANIFOLD_JITTER  = _env("MANIFOLD_JITTER", 0.08, float)      # manifold_noise: amplitude jitter std
 MANIFOLD_BLUR_RAND = _env("MANIFOLD_BLUR_RAND", 0.5, float)  # manifold_noise: per-sample blur uniform jitter (0=fixed)
+MANIFOLD_ANNEAL   = _env("MANIFOLD_ANNEAL", 0.0, float)   # manifold_noise: cosine-anneal blur frac to this fraction of initial over training (0=off, e.g. 0.2 -> decay to 20%)
+MS_WEIGHT       = _env("MS_WEIGHT", 1.0, float)     # weight on the multi-step rollout loss term
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 # VAE/AE-latent context corruption (simulates rollout drift without model self-outputs)
@@ -121,6 +123,7 @@ VAE_BETA        = _env("VAE_BETA", 1e-3, float)   # KL weight (small -> sharp re
 UNCOND_PROB     = _env("UNCOND_PROB", 0.0, float)   # train: prob of dropping context (unconditional)
 GUIDANCE        = _env("GUIDANCE", 1.0, float)     # infer: v = v_uncond + GUIDANCE*(v_cond - v_uncond)
 _VAE = None   # global trained corruptor (vae, latent_std), set in main
+_STEP = 0       # current training step (for annealing schedules)
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 
 
@@ -473,10 +476,16 @@ def augment_context(ctx, model=None, extra=None, training=True):
             corrupted = corrupted * scale
         return corrupted
 
-    if TECHNIQUE == "manifold_noise":
+    if TECHNIQUE in ("manifold_noise", "manifold_ms"):
         # manifold-aligned-ish: mild blur (smooth, plausible) + amplitude jitter.
         # Emulates the model's actual rollout error (wider, lower-amp blob).
         base_sb = BLUR_SIGMA * MANIFOLD_BLUR_FRAC
+        if MANIFOLD_ANNEAL > 0 and TRAIN_STEPS > 0:
+            # cosine-anneal the blur down over training to track the model's
+            # shrinking rollout error (semi-closed-loop: static corruption
+            # over-corrupts late; annealing approximates self-feed's compounding).
+            frac = 0.5 * (1 + math.cos(math.pi * min(1.0, _STEP / max(1, TRAIN_STEPS))))
+            base_sb = base_sb * (MANIFOLD_ANNEAL + (1.0 - MANIFOLD_ANNEAL) * frac)
         if MANIFOLD_BLUR_RAND > 0:
             sb = base_sb * (1.0 - MANIFOLD_BLUR_RAND + 2.0 * MANIFOLD_BLUR_RAND * torch.rand(B, 1, 1, 1, 1, device=ctx.device))
         else:
@@ -565,6 +574,8 @@ def train(data):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, TRAIN_STEPS)
     last_loss = 0.0
     for step in range(TRAIN_STEPS):
+        global _STEP
+        _STEP = step
         ctx, tgt, extra, tgt2 = data.sample_windows(BATCH, rng)
         t = torch.rand(BATCH, device=DEVICE)
         eps = torch.randn_like(tgt)
@@ -586,8 +597,19 @@ def train(data):
             loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
         # multi-step rollout loss: predict tgt2 from [ctx[:,1], model_pred(tgt)],
         # training the model to stay consistent when its own output is fed back.
-        if TECHNIQUE in ("selffeed_ms", "selffeed_msgate", "vae_ms") and MS_PROB > 0 and rng.rand() < MS_PROB:
-            if TECHNIQUE == "vae_ms" and _VAE is not None:
+        if TECHNIQUE in ("selffeed_ms", "selffeed_msgate", "vae_ms", "manifold_ms") and MS_PROB > 0 and rng.rand() < MS_PROB:
+            if TECHNIQUE == "manifold_ms":
+                # SELF-FEED-FREE multi-step loss: use a manifold-corrupted (blur+jitter)
+                # version of the REAL frame t as the drifted context for predicting t+1.
+                # No model self-outputs, no VAE. Emulates rollout drift as a LOSS.
+                with torch.no_grad():
+                    sb = BLUR_SIGMA * MANIFOLD_BLUR_FRAC
+                    Bb = tgt.shape[0]
+                    if MANIFOLD_BLUR_RAND > 0:
+                        sb = sb * (1.0 - MANIFOLD_BLUR_RAND + 2.0 * MANIFOLD_BLUR_RAND * torch.rand(Bb, device=tgt.device))
+                    pred1 = _blur2d(tgt, float(sb.mean()))
+                    pred1 = pred1 * (1.0 + MANIFOLD_JITTER * torch.randn(Bb, 1, 1, 1, device=tgt.device))
+            elif TECHNIQUE == "vae_ms" and _VAE is not None:
                 # SELF-FEED-FREE multi-step loss: use an AE-corrupted version of the
                 # REAL frame t (not a model prediction) as the drifted context for
                 # predicting t+1. Emulates rollout drift as a LOSS, no self-outputs.
@@ -609,7 +631,7 @@ def train(data):
                 v_pred2 = model.get_velocity(z_t2, ctx2_aug, t2)
                 w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=200.0)
                 loss_ms = (((v_pred2 - v_target2) ** 2).mean(dim=(1, 2, 3)) * w2).mean().float()
-            loss = loss + loss_ms
+            loss = loss + MS_WEIGHT * loss_ms
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
