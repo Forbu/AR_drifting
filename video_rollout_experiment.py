@@ -110,6 +110,7 @@ SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
 MANIFOLD_BLUR_FRAC = _env("MANIFOLD_BLUR_FRAC", 0.6, float)  # manifold_noise: blur = BLUR_SIGMA * this
 MANIFOLD_JITTER  = _env("MANIFOLD_JITTER", 0.08, float)      # manifold_noise: amplitude jitter std
 MANIFOLD_BLUR_RAND = _env("MANIFOLD_BLUR_RAND", 0.5, float)  # manifold_noise: per-sample blur uniform jitter (0=fixed)
+MANIFOLD_LAST_ONLY = _env("MANIFOLD_LAST_ONLY", 0, int)  # manifold_noise: 1=corrupt only the last (most-recent) context frame (the slot that holds the model's own output at inference); 0=all frames
 MANIFOLD_ANNEAL   = _env("MANIFOLD_ANNEAL", 0.0, float)   # manifold_noise: cosine-anneal blur frac to this fraction of initial over training (0=off, e.g. 0.2 -> decay to 20%)
 MS_WEIGHT       = _env("MS_WEIGHT", 1.0, float)     # weight on the multi-step rollout loss term
 DIFFFORCE_P     = _env("DIFFFORCE_P", 0.5, float)
@@ -491,6 +492,10 @@ def augment_context(ctx, model=None, extra=None, training=True):
         else:
             sb = base_sb
         blurred = _blur2d(ctx, float(sb.mean()))
+        if MANIFOLD_LAST_ONLY and ctx.shape[1] > 1:
+            # only the most-recent context slot is the model's (degraded) output at inference
+            blurred = torch.stack([ctx[:, k] if k < ctx.shape[1] - 1 else blurred[:, k]
+                                   for k in range(ctx.shape[1])], dim=1)
         scale = 1.0 + MANIFOLD_JITTER * torch.randn(B, 1, 1, 1, 1, device=ctx.device)
         return blurred * scale
 
