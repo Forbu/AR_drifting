@@ -149,3 +149,27 @@ Full writeup: JIT3D_FINDINGS.md. Summary:
   better first (more data, not more steps).
 - A larger patch (JIT_PATCH_HW=8) to cut token count and overfitting — may let the
   ViT train better on tiny data. Not tested.
+
+### FINAL jit3d corruption result (2026-07-05, 24 experiments)
+Best config: **PROB=0.5 + production defaults (EMBED=0.10, BLOCK0=0.05) +
+SAMPLE_AVG=4 + 3000 steps + fp32 (AMP=0) + RF_WCLAMP=50 + LR 1e-4 →
+ED 20334, sharp 0.19** (-22% vs well-trained no-aug 26104).
+
+EXHAUSTED / disproven this session:
+- ~~manifold_noise + latent corruption combo~~: CONFLICT. Input aug raises ED
+  (23933->36717) even though it fixes mass_drift (0.57->0.17). manifold_noise
+  causes positional divergence on the ViT. Corruption-only is best for ED.
+- ~~longer training (3500+ steps)~~: now stable under WCLAMP=50 but ED gets WORSE
+  (sharper per-frame but more trajectory divergence in chaotic regime).
+- ~~corruption with gentler magnitude (EMBED=0.05/no-block0)~~: 2x worse ED.
+  Production magnitudes are load-bearing.
+- ~~lower PROB (0.3) + AVG4~~: AVG4 only helps at high PROB (non-monotonic).
+
+REMAINING (low prior on THIS benchmark; the gap is data/architecture, not aug):
+- The ViT is ~45x behind conv (20334 vs 451) due to data-hungry architecture on
+  220 trajectories. NOT fixable via aug — needs production-scale data where the
+  ViT's scaling/long-range advantage appears.
+- For PRODUCTION: corruption mechanism is validated (works on well-trained ViT);
+  the failure mode to monitor is blur-collapse via context-downweighting early in
+  training. Keep defaults, tune PROB on the ED/sharpness Pareto (0.3=sharp 0.23,
+  0.5=low-ED 0.19).

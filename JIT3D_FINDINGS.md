@@ -8,18 +8,21 @@ backbone and with input-space jitter/blur augmentation.
 1. The ViT needs **two training fixes** before anything works: **fp32** (bf16
    diverges under the RF `1/(1-t)²` loss) and a **lower loss-weight clamp
    (`RF_WCLAMP=50`, default 200)** that tames the t≈0 instability. With these,
-   the ViT trains properly (train_loss **0.068**, beating conv's 0.13).
-2. **Latent-noise corruption WORKS on the well-trained ViT** — it improves both
-   rollout ED (26104→23933) and sharpness (0.21→0.23) with no collapse. The
-   earlier "it collapses" finding was an artifact of the undertrained model.
-3. **Input-space jitter/blur (manifold_noise) is worse than latent corruption on
-   the well-trained ViT** (ED 31611, sharp 0.18). There is a regime flip:
-   input-aug wins when the ViT is *undertrained*, latent corruption wins when
-   *well-trained*.
-4. **The conv backbone still crushes the ViT on this tiny benchmark** (ED 451 vs
-   23933; sharp 1.11 vs 0.23) — the ViT is data-hungry and the conv's
-   locality/translation inductive bias is perfect for blob forecasting. The ViT's
-   advantage appears at production data scale, not here.
+   the ViT trains properly (train_loss **0.068–0.08**, beating conv's 0.13).
+2. **The latent-noise corruption does NOT robustly improve the ViT — its effect is
+   seed/data-dependent.** It helped at SEED=0 (ED 26104→20334) but **hurt at
+   SEED=2** (ED 11153→18588, sharpness collapsed 0.18→0.099) at *both*
+   magnitudes tested. The SEED=0 "win" was overfitting to that seed. ⚠️ This is
+   the key caveat — see "Generalization check" below.
+3. **The most robust config is the well-trained NO-AUG ViT** (fp32 + RF_WCLAMP=50).
+   At SEED=2 it reaches ED 11153 / sharp 0.18 with no collapse risk.
+4. **Input-space jitter/blur (manifold_noise) is worse than no-aug on the ViT's
+   ED** (positional divergence); its only upside is better mass_drift, but
+   combining it with corruption conflicts (ED worse).
+5. **The conv backbone still crushes the ViT on this tiny benchmark** (ED 451 vs
+   ~11–26k) — the ViT is data-hungry and the conv's locality/translation
+   inductive bias is perfect for blob forecasting. The ViT's advantage appears at
+   production data scale, not here.
 
 ## Setup
 - `ARCH=jit3d` wraps the real production model
@@ -54,6 +57,27 @@ backbone and with input-space jitter/blur augmentation.
 \* undertrained regime (WCLAMP=200) — the ED "win" is a blur-collapse artifact
 (see below); do not trust.
 
+## Generalization check (CRITICAL — changes the conclusion)
+
+All corruption "wins" above were at **SEED=0 only**. Cross-seed validation:
+
+| Seed | Config | rollout_ed | sharp | mass_drift | verdict |
+|---|---|---|---|---|---|
+| 0 | no-aug | 26104 | 0.21 | 0.53 | baseline |
+| 0 | corrupt PROB=.5 +AVG4 | 20334 | 0.19 | 0.62 | **helped** (-22%) |
+| 2 | no-aug | 11153 | 0.18 | 0.63 | baseline |
+| 2 | corrupt PROB=.5 +AVG4 | 18588 | 0.099 | 0.68 | **HURT** (+66%, blur collapse) |
+| 2 | corrupt PROB=.3 | 19690 | 0.14 | 0.60 | **HURT** (+76%) |
+
+(ED is not cross-seed comparable — different holdout/reference per seed — but the
+within-seed no-aug-vs-corruption comparison is valid.)
+
+**The corruption helps when the no-aug model is bad (SEED=0: high positional
+divergence) and hurts when the no-aug model is already well-behaved (SEED=2).**
+Its blur-collapse tendency is always present; at SEED=0 it was masked by the
+base model being worse. **This is exactly the overfit-to-seed failure the
+generalization mandate is designed to catch.**
+
 ## Key findings
 
 1. **Latent corruption's effect depends entirely on training maturity.**
@@ -83,14 +107,19 @@ backbone and with input-space jitter/blur augmentation.
    before trusting an ED drop on the ViT.
 
 ## Recommendation for the user's production model
-- Keep the LatentContextCorruptor, but **validate its magnitude on a fully-trained
-  checkpoint**. The failure mode to monitor is blur collapse via
-  context-downweighting — watch rollout **sharpness + mass/energy drift**, not
-  only distributional ED.
+- **The latent corruptor is NOT a guaranteed win — it is brittle/data-dependent.**
+  It helps when the base model has high rollout divergence and hurts when the base
+  is already well-behaved, with an inherent blur-collapse tendency (sharpness
+  drops). Treat it as an **optional regularizer to A/B-test per dataset**, not a
+  default. The most robust recipe here is simply the well-trained no-aug ViT.
+- When A/B-testing it, **monitor rollout sharpness + mass/energy drift** (not only
+  distributional ED) and **validate on a second seed/holdout** before trusting any
+  improvement — single-seed gains did not reproduce.
 - Use **fp32** (or loss-scaled mixed precision) for this ViT + RF-velocity loss;
   bf16 diverges.
-- Consider lowering the RF loss-weight clamp if you see optimizer instability
-  spikes (it trades a small amount of high-t emphasis for big stability gains).
-- Input-space context augmentation (blur + amplitude jitter) is a robust
-  complement — safer early in training, and a good fallback if the latent
-  corruptor shows blur-collapse signs.
+- Consider lowering the RF loss-weight clamp (`RF_WCLAMP` 200→50) if you see
+  optimizer instability spikes — big stability gain for negligible cost.
+- Input-space context augmentation (blur + amplitude jitter) is a safer
+  complement/fallback if the latent corruptor shows blur-collapse signs.
+- The ViT will only reach conv-level quality here with **production-scale data**;
+  the gap on this 220-trajectory benchmark is architectural, not aug-tunable.
