@@ -95,6 +95,9 @@ BLOB_SIGMA      = _env("BLOB_SIGMA", 2.2, float) # pixel width
 TRAIN_STEPS     = _env("TRAIN_STEPS", 2000, int)
 BATCH           = _env("BATCH", 96, int)
 LR              = _env("LR", 2e-3, float)
+GRAD_CLIP       = _env("GRAD_CLIP", 1.0, float)    # max grad norm (ViT/jit3d needs tighter, e.g. 0.5, vs conv default 1.0)
+AMP             = _env("AMP", 1, int)            # 1=bf16 autocast (fast); 0=fp32 (stable for jit3d, which diverges under bf16+200x loss weight)
+WARMUP_STEPS    = _env("WARMUP_STEPS", 0, int)    # linear LR warmup (helps ViT/jit3d optimization stability); 0 = off (cosine from full LR)
 ODE_STEPS       = _env("ODE_STEPS", 16, int)     # Euler substeps for sampling
 ARCH            = os.environ.get("ARCH", "conv2d")   # conv2d (channel-concat) | conv3d (3D-conv context encoder) | jit3d (production JiT-3D ViT)
 LATENT_BLUR     = _env("LATENT_BLUR", 0.0, float)    # ARCH=conv3d: sigma for blurring the CONTEXT LATENT in feature space (inside the net) during training
@@ -144,6 +147,12 @@ UNCOND_PROB     = _env("UNCOND_PROB", 0.0, float)   # train: prob of dropping co
 GUIDANCE        = _env("GUIDANCE", 1.0, float)     # infer: v = v_uncond + GUIDANCE*(v_cond - v_uncond)
 _VAE = None   # global trained corruptor (vae, latent_std), set in main
 _STEP = 0       # current training step (for annealing schedules)
+import contextlib as _contextlib
+def _amp():
+    """autocast context: bf16 if AMP=1 (default, fast), else fp32 (jit3d-stable)."""
+    if AMP:
+        return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return _contextlib.nullcontext()
 MS_PROB         = _env("MS_PROB", 0.3, float)    # prob of a 2-step rollout loss term (selffeed_ms)
 
 
@@ -758,7 +767,19 @@ def train(data):
         model = VideoRF(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     rng = np.random.RandomState(SEED + 1)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, TRAIN_STEPS)
+    if WARMUP_STEPS > 0:
+        # linear warmup -> cosine decay. ViT/jit3d need warmup to avoid early loss spikes.
+        warmup = WARMUP_STEPS
+        eta0 = LR
+        import math as _math
+        def _lr(step):
+            if step < warmup:
+                return eta0 * (step + 1) / warmup
+            prog = (step - warmup) / max(1, TRAIN_STEPS - warmup)
+            return 0.5 * eta0 * (1.0 + _math.cos(_math.pi * min(1.0, prog)))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, _lr)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, TRAIN_STEPS)
     last_loss = 0.0
     for step in range(TRAIN_STEPS):
         global _STEP
@@ -775,7 +796,7 @@ def train(data):
             if drop.any():
                 ctx_aug = ctx_aug.clone()
                 ctx_aug[drop] = 0.0
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with _amp():
             v_pred = model.get_velocity(z_t, ctx_aug, t)
             # inverse-conditional-variance weight 1/(1-t)^2 clamped (RF x-pred)
             w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=200.0)
@@ -814,14 +835,14 @@ def train(data):
             eps2 = torch.randn_like(tgt2)
             z_t2 = (1 - t2.view(-1, 1, 1, 1)) * eps2 + t2.view(-1, 1, 1, 1) * tgt2
             v_target2 = tgt2 - eps2
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with _amp():
                 v_pred2 = model.get_velocity(z_t2, ctx2_aug, t2)
                 w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=200.0)
                 loss_ms = (((v_pred2 - v_target2) ** 2).mean(dim=(1, 2, 3)) * w2).mean().float()
             loss = loss + MS_WEIGHT * loss_ms
         opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         opt.step()
         sched.step()
         last_loss = loss.item()
