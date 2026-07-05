@@ -101,6 +101,7 @@ LATENT_BLUR     = _env("LATENT_BLUR", 0.0, float)    # ARCH=conv3d: sigma for bl
 MODEL_CH        = _env("MODEL_CH", 48, int)       # conv channel width of the forecaster
 MODEL_BLOCKS    = _env("MODEL_BLOCKS", 4, int)     # number of conv blocks
 NOISE_INJECT    = _env("NOISE_INJECT", 0.0, float)    # >0: stochastic RF sampler - re-noise z during ODE proportional to remaining noise level (regularizes deterministic drift)
+SAMPLE_AVG      = _env("SAMPLE_AVG", 1, int)        # >1: average this many noise-sample predictions per AR rollout step (variance reduction -> less drift compounding)
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -739,11 +740,32 @@ def train(data):
 # 5. SAMPLING & ROLLOUT
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def sample_step(model, ctx, n_ode, guidance=None):
+def sample_step(model, ctx, n_ode, guidance=None, n_samples=None):
     """Sample one frame (B,C,H,W) from context ctx (B,K,C,H,W).
-    guidance=None -> use global GUIDANCE (inference); pass 1.0 to disable (training)."""
+    guidance=None -> use global GUIDANCE (inference); pass 1.0 to disable (training).
+    n_samples>1: average that many noise-sample endpoints (variance reduction)."""
+    n_samples = SAMPLE_AVG if n_samples is None else n_samples
     g = GUIDANCE if guidance is None else guidance
     B = ctx.shape[0]
+    if n_samples > 1:
+        # replicate contexts across N noise samples, integrate together, average
+        ctx_aug = augment_context(ctx, training=False)
+        ctx_rep = ctx_aug.repeat_interleave(n_samples, dim=0)  # B*N,K,C,H,W
+        z = torch.randn(B * n_samples, C_CHAN, IMG, IMG, device=DEVICE)
+        dt = 1.0 / n_ode
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            for i in range(n_ode):
+                t = torch.full((B * n_samples,), i * dt, device=DEVICE)
+                v = model.get_velocity(z, ctx_rep, t)
+                if g != 1.0:
+                    v_u = model.get_velocity(z, torch.zeros_like(ctx_rep), t)
+                    v = v_u + g * (v - v_u)
+                z = z + v * dt
+                if NOISE_INJECT > 0:
+                    remaining = (1.0 - (i + 1) * dt).clamp(min=0.0)
+                    z = z + NOISE_INJECT * math.sqrt(dt) * remaining * torch.randn_like(z)
+        z = z.view(B, n_samples, C_CHAN, IMG, IMG).mean(dim=1)  # average over samples
+        return z.float()
     z = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
     dt = 1.0 / n_ode
     ctx_aug = augment_context(ctx, training=False)
