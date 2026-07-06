@@ -199,3 +199,64 @@ Headline: the dominant lever for the ViT was the RF loss-weight clamp
 - ViT ED 1210 (S0) vs conv 451 - 2.7x gap is data-scale/inductive-bias (ViT must
   learn Lorenz dynamics from 220 traj; conv's locality is ideal). Closes with
   production-scale data, not tricks.
+
+## 2026-07-06 session: power-norm latent corruption + learned adversarial augmentor + 2k data
+
+### METHODOLOGY: benchmark ED is NOISY (critical)
+- No-corruption baseline ED swings 1553<->1825 (+17.5%) run-to-run while
+  train_loss is rock-stable (0.0074). The ~17% ED noise is INHERENT to the
+  chaotic Lorenz rollout (not from corruption). train_loss/sharpness/mass are
+  stable; rollout_ed is NOT. Single-run ED comparisons are unreliable; need
+  >5-6% to trust. For the ViT, trust sharpness+mass, not ED, when any
+  perturbation/aug is active (blur regresses pooled features to the reference
+  mean -> ED drops while quality drops = metric-gaming).
+
+### Power-norm (per-token L2) latent corruption = FAILS like old corruption
+- jit3d LatentContextCorruptor now uses per-token L2 power-norm (user spec).
+- Strong/sparse (PROB=0.3, EMBED>=0.10): HURTS (sharp 0.84->0.81, ED worse).
+- Gentle/frequent (PROB>=0.7, EMBED~0.03, embed-only): NEUTRAL on ED (mean 1595
+  ~ baseline 1689, within noise), MODEST tendency to improve sharpness (0.87 vs
+  0.84) + mass (0.065 vs 0.080) but buried in noise. The ONLY non-harmful variant.
+- block0-stage corruption is the HARMFUL one (corrupting post-attention features
+  worse than raw patch features). embed-only ~neutral.
+- Partial vindication of user's hypothesis: power-norm blurs LESS than old global
+  mean/std corruption (sharpness hit -3.6% vs -8.4%). But no ED gain on a
+  well-calibrated model (corruption is pure robustness tax there).
+- VERDICT: corruption doesn't help the well-calibrated ViT regardless of
+  normalization. For production: validate magnitude on well-trained checkpoint
+  on real data; treat as optional brittle regularizer, not a default.
+
+### Learned adversarial conv augmentor (TECHNIQUE=learned_adv) = DEAD
+- Implemented: small conv G(context,noise)->per-frame power-normalized residual,
+  trained adversarially (maximize RF loss) within eps-ball. Input-space (sound,
+  model can't cancel). Decoupled at inference.
+- Unconstrained (eps=0.05): HURTS sharp 0.63, mass 0.22, ED 2248. Adversary
+  attacks BLOB POSITION first (highest-loss direction in position-critical task)
+  -> positional divergence. Same root cause as manifold_noise.
+- Texture-CONSTRAINED (high-pass hp=2.5): HURTS WORSE sharp 0.33. Constraining
+  to high-freq makes adversary attack TEXTURE directly (=what sharpness measures).
+- ROOT CAUSE (definitive): classic robustness-accuracy tradeoff. The adversarial
+  WORST-CASE input is out-of-distribution for CLEAN inference (rollout uses clean
+  decoupled context). Every attackable direction (position OR texture) is one the
+  model needs. Training on OOD-hard examples degrades clean-inference performance.
+  Adversary's best case (disabled) = neutral = no-aug.
+- VERDICT: input-space adversarial robustness is the WRONG tool for clean-inference
+  forecasting. "Robustify from noise" is better served by matching the ACTUAL
+  inference drift distribution (self-feed / snapshot-bank), NOT the worst-case.
+
+### 2k trajectories = NOT benchmarkable in 4-min budget
+- 2k @ fixed compute (BATCH=96/4500) UNDERTRAINS: ED worse, train_loss 0.014 vs
+  0.0075 (2.8 epochs vs 25). 2k @ BATCH=256: train_loss 0.029 (LR too low for
+  batch), sharp 0.77 (blurry undertraining -> ED 1258 is metric-gaming).
+- Fully converging on 2k needs ~9x compute (~12-26 min/run). Impractical for the
+  fast loop. 2k is a PRODUCTION-scale lever, not benchmarkable here.
+- For production: more data WILL help the ViT (scaling advantage) given real compute.
+
+### SESSION CONCLUSION (technique space re-confirmed exhausted)
+- Latent corruption (any norm), learned adversarial augmentor (any constraint),
+  and 2k-data-at-fixed-compute all FAIL or are impractical here.
+- Champions STAND: RF_WCLAMP=6 + fp32 + SAMPLE_AVG=4 + ODE_STEPS=32 + ~4500 steps.
+- Remaining ViT-vs-conv gap is inductive-bias/data-scale (closes only with conv
+  architecture or production-scale data + compute).
+- HIGHEST-VALUE untried (if user wants to keep going on THIS benchmark): JIT_PATCH_HW=8
+  (fewer tokens, less overfit on 220 traj) and K_CTX=3/4 (more context frames).
