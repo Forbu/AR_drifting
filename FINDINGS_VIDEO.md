@@ -294,3 +294,94 @@ TECHNIQUE=selffeed_m SELFFEED_PROB=0.3 BLUR_SIGMA=1.0 python video_rollout_exper
 # multichannel robustness:
 C_CHAN=2 SEED=1 TECHNIQUE=selffeed_m SELFFEED_PROB=0.3 BLUR_SIGMA=1.0 python video_rollout_experiment.py
 ```
+
+## Brownian-Bridge Flow Matching (FLOW=bridge) — AR-stability investigation
+
+**Question (user):** Replace the linear rectified-flow path with a Brownian-bridge
+probability path (cf. `hypersphere_bridge_experiment.py`, Lim et al. 2024
+arXiv:2410.03229) and combine with the jit3d backbone + manifold context aug, to
+improve AR rollout stability. Bridge path: `z_t = (1-t)eps + t y + c_t eta`,
+`c_t^2 = sigma^2 t(1-t) + sigma_min^2` — variance minimal at BOTH endpoints
+(clean data landing at t=1 -> minimal off-manifold jitter fed forward into the
+next AR step), maximal mid-path.
+
+### Implementation
+- x-prediction model (predicts clean target `y`); three loss modes via `BRIDGE_LOSS`:
+  - `vloss` (default): velocity-matching `||v_theta-u_t||^2 = (x_pred-y)^2 (1-t c'/c)^2`
+    clamped. A **one-sided data-end upweight** (like RF's `1/(1-t)^2`) — prevents the
+    context-prediction collapse. The literal bridge v-loss.
+  - `ivar`: inverse-conditional-variance `1/c_t^2` (upweights BOTH endpoints).
+  - `uniform`: plain x-pred MSE (the user's production reference; collapses here).
+- Exact closed-form ODE sampler: `z(t+dt) = mu_next + (z-mu_t) c(t+dt)/c(t)` —
+  absorbs the stiff `c'/c` mean-reversion into the O(1) ratio; lands exactly on
+  `x_pred` at t=1. (Naive Euler with the bridge velocity diverges via c'/c.)
+
+### Results (jit3d 800k champion arch, SEED=0, dt=0.012)
+
+**1. Loss type matters — uniform COLLAPSES:**
+| BRIDGE_LOSS | rollout_ed | sharp | mass | train_loss | note |
+|---|---|---|---|---|---|
+| vloss (wclamp10) | 1124 | 1.09 | 0.036 | 3.8e-5 | **best** — no collapse |
+| ivar (wclamp200) | 1103 | 0.95 | 0.040 | 0.0011 | tied ED, slightly worse quality |
+| uniform | 1363 | 1.18 | 0.072 | 3.8e-5 | **COLLAPSE** to context-pred |
+
+Uniform x-pred collapses to "predict from context, ignore z_t" on this easy
+single-blob data (train_loss anomalously low, sharpness 1.18 artifacts). The
+`1/(1-t)^2` / `1/c_t^2` weighting exists precisely to prevent this by forcing z_t
+usage at the data end. The user's uniform "v-loss" works on their production data
+(multi-channel sat+lightning — context alone can't determine the target -> no
+collapse) but NOT on easy data. **The vloss `(1-t c'/c)^2` weight is the correct
+well-behaved bridge loss** (one-sided data-end upweight, no collapse). Note:
+train_loss magnitude is NOT comparable across loss types (weight scale differs);
+model QUALITY (sharp/mass) is the signal.
+
+**2. sigma sweep (U-shape, vloss, wclamp10):** 0.5->ed_late 1630, **0.3->1222
+(min)**, 0.2->1736. sigma=0.3 optimal — too much mid-path noise blurs, too little
+loses the bridge regularization (path->RF, weight->collapse regime).
+
+**3. wclamp:** 10 optimal. wclamp=6 (RF's optimal) -> sharp 1.16 artifacts, mass
+0.062 (ED drop is metric-gaming via high-freq artifacts). RF's clamp doesn't
+transfer to the bridge weight profile.
+
+**4. sigma_min:** 1e-3 optimal. 1e-4 (sharper landing) -> sharp 1.17 artifacts
+(too-sharp endpoint amplifies x_pred error). The small residual softens the landing.
+
+**Best bridge config:** `FLOW=bridge BRIDGE_LOSS=vloss BRIDGE_SIGMA=0.3
+BRIDGE_WCLAMP=10 BRIDGE_SIGMA_MIN=1e-3` -> ED 1174, ed_late 1222, sharp 1.06,
+mass 0.025 (vloss sigma sweep at sigma=0.3; ivar sigma=0.5 baseline was ED 1103).
+
+### vs RF champion (dt=0.012): bridge ~1.4x RF ED (1174 vs 803), competitive sharpness
+On EASY data (single moderate-motion blob) the well-tuned RF is already great, so
+the bridge does NOT improve ED here. Sharpness competitive (1.06 vs 1.03).
+
+### KEY FINDING — bridge >> RF in the UNSTABLE regime (dt=0.024 fast motion)
+At dt=0.024 the RF champion is severely unstable (run 158, same env). The bridge
+(vloss/sigma=0.3) dramatically tames it (clean comparison, same arch/regime):
+| metric | RF (run158) | **Bridge** | ratio |
+|---|---|---|---|
+| rollout_ed | 4326 | **1541** | **2.8x better** |
+| sharpness | 2.87 (severe artifacts) | **1.13** (mild) | tamed |
+| mass_drift | 0.60 | **0.086** | **7x better** |
+| ed_late | 39817 | **2662** | **15x better** |
+
+This is the bridge's **stated purpose demonstrated**: the clean endpoint landing
+(variance->sigma_min^2~0) means each AR step injects minimal off-manifold jitter
+into the next -> drift doesn't compound -> stable long rollout. RF's straight-line
+path (variance 0 everywhere) overshoots in fast motion; the bridge's
+mean-reverting path is self-correcting. The bridge's value appears **WHERE RF
+STRUGGLES** (hard/unstable dynamics), matching the hypersphere result (bridge
+helped there too — harder data).
+
+### manifold_noise + bridge: HURTS
+manifold_noise (blur+jitter context aug) over-corrupts the bridge (ED 1732 vs
+bridge+none 1103). The bridge ALREADY regularizes the target via mid-path Brownian
+noise + clean endpoint; adding context aug is redundant/conflicting. Use ONE, not
+both. (For the bridge, no context aug = TECHNIQUE=none is best.)
+
+### Recommendation
+The bridge is **NOT a universal win over RF**. It's competitive on quality where RF
+is already good, and dramatically better where RF is unstable (fast/hard dynamics).
+For production: use the bridge if your dynamics are fast/unstable or you observe RF
+rollout artifacts / mass drift; otherwise a well-tuned RF is fine. The `vloss`
+loss is required (uniform collapses on easy data; the `(1-t c'/c)^2` one-sided
+data-end upweight prevents collapse while being a genuine velocity loss).

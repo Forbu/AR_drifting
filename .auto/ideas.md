@@ -364,3 +364,49 @@ DATA-SCALE (production compute), not addressable on this 4-min benchmark without
 overfitting. The benchmark's AR-stability PURPOSE was addressed via architecture
 (less overfitting -> better generalization -> less rollout drift), NOT via
 augmentation/robustness (all failed: corruption, adversarial, stochastic sampler).
+
+## 2026-07-06 session: Brownian-bridge flow matching (FLOW=bridge) — EXPLORED
+
+### RESULT: bridge helps WHERE RF STRUGGLES, not on easy data
+- Implemented FLOW=bridge (z_t=(1-t)eps+t y+c_t eta, c_t^2=sigma^2 t(1-t)+sigma_min^2)
+  + exact closed-form ODE sampler + 3 loss modes (vloss/ivar/uniform). Composes
+  with any TECHNIQUE (context aug orthogonal to target flow path).
+- EASY regime (dt=0.012, single blob): bridge ~1.4x RF ED (1174 vs 803), competitive
+  sharpness. RF already well-tuned -> bridge doesn't help.
+- HARD/unstable regime (dt=0.024 fast motion): bridge DRAMATICALLY better — ED 1541
+  vs RF 4326 (2.8x), mass 0.086 vs 0.60 (7x), ed_late 2662 vs 39817 (15x), tames
+  artifacts (sharp 2.87->1.13). Clean 2x2 (same env/arch). This is the bridge's
+  stated AR-stability purpose DEMONSTRATED: clean endpoint landing -> minimal drift
+  injection -> stable long rollout.
+- Matches hypersphere result (bridge helped there — harder data).
+
+### KEY LESSONS (transferable to production)
+- **Loss type matters (COLLAPSE):** uniform-weighted x-pred (user's production
+  reference 'v-loss') COLLAPSES to "predict from context, ignore z_t" on EASY data
+  (train_loss anomalously low, sharp>1.1 artifacts). Needs hard data to avoid.
+  The `(1-t c'/c)^2` vloss weight (one-sided data-end upweight) prevents collapse.
+  For the user's HARD production data, uniform may be fine (context insufficient) —
+  but vloss is the robust choice regardless.
+- **train_loss NOT comparable across loss types** (weight scale differs: ivar
+  ~30-50x, vloss ~0.5x, uniform 1x). Trust sharpness/mass, not train_loss magnitude.
+- **RF hyperparams don't transfer to bridge:** RF's optimal RF_WCLAMP=6 -> bridge
+  artifacts; bridge wants wclamp=10. sigma=0.3 U-shaped optimum (0.2 too low -> RF-like,
+  0.5 too high -> blur).
+- **Bridge + manifold_noise CONFLICT:** manifold over-corrupts (bridge already
+  regularizes target). Use one or the other.
+
+### OPTIMAL bridge config (committed): FLOW=bridge BRIDGE_LOSS=vloss
+BRIDGE_SIGMA=0.3 BRIDGE_WCLAMP=10 BRIDGE_SIGMA_MIN=1e-3, jit3d 800k/PHW8/none.
+ED 1174/ed_late 1222/sharp 1.06/mass 0.025 (dt=0.012).
+
+### DONE / not worth retrying
+- ~~manifold + bridge~~: conflicts (1732 > 1103).
+- ~~sigma 0.2/0.5~~: U-shape, 0.3 optimal.
+- ~~wclamp 6~~: artifacts (metric-gaming).
+- ~~sigma_min 1e-4~~: too-sharp landing, artifacts.
+
+### UNTRIED (lower priority)
+- Bridge at dt=0.024 with sigma=0.5 (harder regime may want more mid-path reg).
+  Niche; the 2.8x win over RF at dt=0.024 already demonstrated the mechanism.
+- Bridge on C_CHAN=2 multichannel (more production-like; bridge may help more).
+- Stratified t sampling (user ref 32-bin) for better t coverage — minor.
