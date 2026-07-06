@@ -422,6 +422,27 @@ artifacts + mass drift in long rollouts while the bridge stays stable. Use the
 bridge for production forecasting; tune sigma per regime (~0.3 slow, ~0.5 fast).
 RF is only preferable for very slow/trivial dynamics.
 
+### Bridge value depends on the RF's FAILURE MODE (C=2 caveat)
+Re-tested on multichannel (C_CHAN=2) at dt=0.018 (production-like input). The RF's
+failure mode there is DIFFERENT from C=1:
+| config | RF rollout_ed | RF sharp | RF failure mode |
+|---|---|---|---|
+| C=1, dt=0.018 | 1030 | **1.38** | OVERSHOOT (artifacts, ed_late 5141) |
+| C=2, dt=0.018 (4500 step) | 1447 | **0.84** | BLUR (under-fits 2 blobs) |
+| C=2, dt=0.018 (6000 step) | 923 | **0.90** | still BLUR (more training helps but no overshoot) |
+
+On C=2 the RF *under-fits and blurs* rather than *overshooting* — so the bridge's
+overshoot-taming advantage **does not apply** there (the bridge is only modestly
+sharper, 0.94 vs 0.90; RF isn't unstable). The bridge's dramatic win is specific
+to regimes where the RF **overshoots** (well-trained + moderate-fast dynamics).
+
+**Production decision rule:** inspect whether your RF model's rollout shows
+**artifacts (sharpness > ~1.1, overshoot)** or **blur (sharpness < ~0.9, under-fit)**.
+- Artifacts/overshoot -> use the bridge (it tames this, big win).
+- Blur/under-fit -> the bridge won't help much; you need more capacity/data/compute.
+(C=2 at the 220-traj/800k/6000-step benchmark under-trains both models — clean
+multichannel validation needs production-scale compute.)
+
 ### manifold_noise + bridge: HURTS
 manifold_noise (blur+jitter context aug) over-corrupts the bridge (ED 1732 vs
 bridge+none 1103). The bridge ALREADY regularizes the target via mid-path Brownian
