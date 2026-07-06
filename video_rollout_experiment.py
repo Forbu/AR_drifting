@@ -129,7 +129,8 @@ SAMPLE_AVG      = _env("SAMPLE_AVG", 1, int)        # >1: average this many nois
 FLOW            = os.environ.get("FLOW", "rf")     # "rf" (linear) | "bridge" (Brownian-bridge flow matching)
 BRIDGE_SIGMA    = _env("BRIDGE_SIGMA", 0.5, float)        # bridge: Brownian perturbation scale (var at t=0.5 = sigma^2/4)
 BRIDGE_SIGMA_MIN = _env("BRIDGE_SIGMA_MIN", 1e-3, float) # bridge: residual endpoint variance (smaller -> sharper landing)
-BRIDGE_WCLAMP   = _env("BRIDGE_WCLAMP", 200.0, float)     # bridge: clamp on the 1/c_t^2 inverse-conditional-variance x-pred weight
+BRIDGE_WCLAMP   = _env("BRIDGE_WCLAMP", 200.0, float)     # bridge: clamp on the loss weight (BRIDGE_LOSS=ivar -> 1/c_t^2; =vloss -> (1-t c'/c)^2)
+BRIDGE_LOSS     = os.environ.get("BRIDGE_LOSS", "vloss")   # bridge loss: "vloss" (velocity-matching ||v-u_t||^2 via x-pred = (x_pred-y)^2 (1-t c'/c)^2 clamped; one-sided data-end upweight, prevents collapse) | "ivar" (inverse-cond-var 1/c_t^2, upweights BOTH endpoints) | "uniform" (plain x-pred MSE; collapses to context-pred on easy data)
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -790,14 +791,30 @@ def _make_zt(t, tgt, eps):
 def _flow_loss_term(model, z_t, tgt, ctx_aug, t, eps):
     """Flow-matching loss term for the active flow. Returns (loss_scalar, x_pred).
     RF:     velocity loss  (v_pred - (tgt-eps))^2 * 1/(1-t)^2  clamped (RF_WCLAMP).
-    Bridge: x-prediction loss  (x_pred - tgt)^2 * 1/c_t^2  clamped (BRIDGE_WCLAMP)
-            — the bridge analog of the RF inverse-conditional-variance weight.
-            (Naive bridge velocity loss diverges via c'/c -> 1/sigma_min^2, so we
-            regress the endpoint directly — matches hypersphere_bridge_experiment.py.)"""
+    Bridge: x-prediction loss (model predicts clean target y); weight depends on
+            BRIDGE_LOSS:
+              vloss   = (x_pred-y)^2 * (1-t c'/c)^2  clamped  (velocity-matching;
+                        one-sided data-end upweight like RF's 1/(1-t)^2 -> prevents
+                        the context-prediction collapse; the literal bridge v-loss).
+              ivar    = (x_pred-y)^2 * 1/c_t^2  clamped  (inverse-conditional-variance;
+                        upweights BOTH endpoints incl. the irreducible noise-end floor).
+              uniform = (x_pred-y)^2 * 1  (plain x-pred MSE; collapses on easy data).
+            (The naive bridge velocity TARGET explodes via c'/c -> 1/sigma_min^2 near
+            endpoints, so we match velocity through the x-prediction reparameterization.)"""
     if FLOW == "bridge":
-        c_t, _ = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
         x_pred = model.forward(z_t, ctx_aug, t)
-        w = (1.0 / (c_t ** 2)).clamp(max=BRIDGE_WCLAMP)
+        if BRIDGE_LOSS == "ivar":
+            c_t, _ = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+            w = (1.0 / (c_t ** 2)).clamp(max=BRIDGE_WCLAMP)
+        elif BRIDGE_LOSS == "uniform":
+            w = torch.ones_like(t)
+        else:  # "vloss" — velocity-matching via x-prediction.
+            # u_t = (y-eps) + (c'/c)(z_t-mu_t);  ||v_theta-u_t||^2 = (x_pred-y)^2 (1-t c'/c)^2.
+            # (1 - t c'/c)^2 ~ 1 at low/mid t, rises toward the DATA end (t->1):
+            # a one-sided data-end upweight that forces z_t usage (no collapse).
+            c_t, cp_over_c = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+            wf = 1.0 - t * cp_over_c                 # (1 - t c'/c), shape (B,)
+            w = (wf ** 2).clamp(max=BRIDGE_WCLAMP)
         loss_vel = ((x_pred - tgt) ** 2).mean(dim=(1, 2, 3)) * w
         return loss_vel.mean().float(), x_pred
     v_pred = model.get_velocity(z_t, ctx_aug, t)
@@ -1068,7 +1085,8 @@ def main():
     np.random.seed(SEED)
     print(f"TECHNIQUE={TECHNIQUE} SIGMA={SIGMA} BLUR_SIGMA={BLUR_SIGMA} "
           f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} ARCH={ARCH} FLOW={FLOW} "
-          f"BRIDGE_SIGMA={BRIDGE_SIGMA} BRIDGE_WCLAMP={BRIDGE_WCLAMP} device={DEVICE}", flush=True)
+          f"BRIDGE_LOSS={BRIDGE_LOSS} BRIDGE_SIGMA={BRIDGE_SIGMA} "
+          f"BRIDGE_WCLAMP={BRIDGE_WCLAMP} device={DEVICE}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,
