@@ -397,6 +397,31 @@ more-unstable dynamics want a higher sigma (more mid-path Brownian regularizatio
 to tame the instability that cripples RF). Too little -> RF-like drift; too much
 -> blur. Both extrema fail (U-shape).
 
+### Bridge-vs-RF crossover is at MODERATE motion (dt~0.018) — key for production
+Characterized bridge vs RF across motion speed (all same arch/env; rollout_ed is
+early/overall, ed_late is the late-half where drift shows):
+| motion | RF rollout_ed | RF ed_late | RF sharp | bridge rollout_ed | bridge ed_late | bridge sharp | winner |
+|---|---|---|---|---|---|---|---|
+| dt=0.012 (slow) | 803 | 802 | 1.03 | 1174 | 1222 | 1.06 | **RF** |
+| dt=0.018 (moderate) | 1030 | **5141** | **1.38** | 1065 | **1112** | 1.06 | **bridge** |
+| dt=0.024 (fast) | 4326 | 39817 | 2.87 | 1312 | 1153 | 1.07 | **bridge** |
+
+The crossover is at **dt~0.015-0.018 (moderate-fast)**, not extreme motion. At
+dt=0.018 the RF's early rollout_ed (1030) looks ~tied with the bridge (1065), but
+RF is ALREADY unstable: ed_late 5141 (4.6x worse), sharpness 1.38 (artifacts),
+mass 0.156 (11x worse) — it diverges over the long rollout. The bridge stays
+rock-solid (ed_late~ED, sharp~1.06, mass~0.014).
+
+**Methodology lesson:** rollout_ed (early/overall) HIDES RF's instability onset —
+the divergence shows in ed_late / sharpness / mass. Always check ed_late +
+sharpness + mass, not only rollout_ed, when judging rollout stability.
+
+**Production recommendation (strengthened):** for any moderate-fast dynamics
+(dt>=~0.018, i.e. realistic weather motion), the well-tuned RF champion develops
+artifacts + mass drift in long rollouts while the bridge stays stable. Use the
+bridge for production forecasting; tune sigma per regime (~0.3 slow, ~0.5 fast).
+RF is only preferable for very slow/trivial dynamics.
+
 ### manifold_noise + bridge: HURTS
 manifold_noise (blur+jitter context aug) over-corrupts the bridge (ED 1732 vs
 bridge+none 1103). The bridge ALREADY regularizes the target via mid-path Brownian
