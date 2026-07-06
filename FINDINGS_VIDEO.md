@@ -364,6 +364,8 @@ At dt=0.024 the RF champion is severely unstable (run 158, same env). The bridge
 | mass_drift | 0.60 | **0.086** | **7x better** |
 | ed_late | 39817 | **2662** | **15x better** |
 
+(sigma=0.3 above; tuned further below.)
+
 This is the bridge's **stated purpose demonstrated**: the clean endpoint landing
 (variance->sigma_min^2~0) means each AR step injects minimal off-manifold jitter
 into the next -> drift doesn't compound -> stable long rollout. RF's straight-line
@@ -371,6 +373,29 @@ path (variance 0 everywhere) overshoots in fast motion; the bridge's
 mean-reverting path is self-correcting. The bridge's value appears **WHERE RF
 STRUGGLES** (hard/unstable dynamics), matching the hypersphere result (bridge
 helped there too — harder data).
+
+### Optimal sigma is REGIME-DEPENDENT (key for production tuning)
+Sweeping BRIDGE_SIGMA at dt=0.024 (both regimes are U-shaped, but the optimum
+shifts HIGHER for harder dynamics):
+| regime | sigma 0.3 | sigma 0.5 | sigma 0.7 | optimum |
+|---|---|---|---|---|
+| dt=0.012 (easy) | **1174** | (0.5 blurs) | — | **0.3** |
+| dt=0.024 (unstable) | 1541 | **1312** | 1949 (blur) | **0.5** |
+
+Tuned bridge (sigma=0.5) at dt=0.024 beats the RF champion even harder, and the
+rollout is now self-correcting (ed_late 1153 < rollout_ed 1312 — frames converge
+toward the manifold over time, drift decays instead of compounding):
+| metric (dt=0.024) | RF | bridge s=0.3 | **bridge s=0.5** | vs RF |
+|---|---|---|---|---|
+| rollout_ed | 4326 | 1541 | **1312** | **3.3x** |
+| ed_late | 39817 | 2662 | **1153** | **35x** |
+| sharpness | 2.87 | 1.13 | **1.07** | tamed |
+| mass_drift | 0.60 | 0.086 | **0.031** | **19x** |
+
+**Transferable rule:** tune BRIDGE_SIGMA per dynamics regime — faster/harder /
+more-unstable dynamics want a higher sigma (more mid-path Brownian regularization
+to tame the instability that cripples RF). Too little -> RF-like drift; too much
+-> blur. Both extrema fail (U-shape).
 
 ### manifold_noise + bridge: HURTS
 manifold_noise (blur+jitter context aug) over-corrupts the bridge (ED 1732 vs
