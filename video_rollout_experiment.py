@@ -119,6 +119,17 @@ JIT_CORRUPT_EMBED  = _env("JIT_CORRUPT_EMBED", 0.10, float)
 JIT_CORRUPT_BLOCK0 = _env("JIT_CORRUPT_BLOCK0", 0.05, float)
 NOISE_INJECT    = _env("NOISE_INJECT", 0.0, float)    # >0: stochastic RF sampler - re-noise z during ODE proportional to remaining noise level (regularizes deterministic drift)
 SAMPLE_AVG      = _env("SAMPLE_AVG", 1, int)        # >1: average this many noise-sample predictions per AR rollout step (variance reduction -> less drift compounding)
+# --- Flow path: linear rectified flow (default) or Brownian-bridge flow matching ---
+# Bridge: z_t = (1-t) eps + t y + c_t eta,  c_t^2 = sigma^2 t(1-t) + sigma_min^2.
+# Variance is minimal at BOTH endpoints (sigma_min^2) and maximal mid-path (sigma^2/4
+# at t=0.5). Motivation for AR forecasting: residual sampling jitter at the data
+# endpoint (t=1) is fed forward and accumulates as off-manifold drift; the bridge
+# drives endpoint variance -> 0 so each AR step lands cleanly on the manifold.
+# (Ref: Lim et al. 2024, arXiv:2410.03229; see hypersphere_bridge_experiment.py.)
+FLOW            = os.environ.get("FLOW", "rf")     # "rf" (linear) | "bridge" (Brownian-bridge flow matching)
+BRIDGE_SIGMA    = _env("BRIDGE_SIGMA", 0.5, float)        # bridge: Brownian perturbation scale (var at t=0.5 = sigma^2/4)
+BRIDGE_SIGMA_MIN = _env("BRIDGE_SIGMA_MIN", 1e-3, float) # bridge: residual endpoint variance (smaller -> sharper landing)
+BRIDGE_WCLAMP   = _env("BRIDGE_WCLAMP", 200.0, float)     # bridge: clamp on the 1/c_t^2 inverse-conditional-variance x-pred weight
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -749,6 +760,55 @@ def extra_loss(x_pred, y_target):
 
 
 # --------------------------------------------------------------------------- #
+# 3a. FLOW PATH — linear rectified flow (RF) or Brownian-bridge flow matching
+# --------------------------------------------------------------------------- #
+def bridge_coeffs(t, sigma, sigma_min):
+    """Brownian-bridge path coefficients (convention: t=0 noise, t=1 data).
+        c_t^2    = sigma^2 * t(1-t) + sigma_min^2
+        c'_t/c_t = sigma^2 (1-2t) / (2 c_t^2)
+    Returns (c_t, cp_over_c). t may be a python float or a tensor."""
+    t = torch.as_tensor(t, dtype=torch.float32, device=DEVICE)
+    var = sigma ** 2 * t * (1.0 - t) + sigma_min ** 2
+    c = torch.sqrt(var)
+    cp_over_c = sigma ** 2 * (1.0 - 2.0 * t) / (2.0 * var + 1e-12)
+    return c, cp_over_c
+
+
+def _make_zt(t, tgt, eps):
+    """Noised target z_t for the active flow. t: (B,).
+    RF:     z_t = (1-t) eps + t tgt.
+    Bridge: z_t = (1-t) eps + t tgt + c_t eta  (extra mid-path Brownian perturbation)."""
+    ts = t.view(-1, 1, 1, 1)
+    mu_t = (1.0 - ts) * eps + ts * tgt
+    if FLOW == "bridge":
+        eta = torch.randn_like(tgt)
+        c_t, _ = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+        return mu_t + c_t.view(-1, 1, 1, 1) * eta
+    return mu_t
+
+
+def _flow_loss_term(model, z_t, tgt, ctx_aug, t, eps):
+    """Flow-matching loss term for the active flow. Returns (loss_scalar, x_pred).
+    RF:     velocity loss  (v_pred - (tgt-eps))^2 * 1/(1-t)^2  clamped (RF_WCLAMP).
+    Bridge: x-prediction loss  (x_pred - tgt)^2 * 1/c_t^2  clamped (BRIDGE_WCLAMP)
+            — the bridge analog of the RF inverse-conditional-variance weight.
+            (Naive bridge velocity loss diverges via c'/c -> 1/sigma_min^2, so we
+            regress the endpoint directly — matches hypersphere_bridge_experiment.py.)"""
+    if FLOW == "bridge":
+        c_t, _ = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+        x_pred = model.forward(z_t, ctx_aug, t)
+        w = (1.0 / (c_t ** 2)).clamp(max=BRIDGE_WCLAMP)
+        loss_vel = ((x_pred - tgt) ** 2).mean(dim=(1, 2, 3)) * w
+        return loss_vel.mean().float(), x_pred
+    v_pred = model.get_velocity(z_t, ctx_aug, t)
+    w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
+    v_target = tgt - eps
+    loss_vel = ((v_pred - v_target) ** 2).mean(dim=(1, 2, 3)) * w
+    x_pred = model.forward(z_t, ctx_aug, t)
+    return loss_vel.mean().float(), x_pred
+
+
+# --------------------------------------------------------------------------- #
 # 4. TRAINING
 # --------------------------------------------------------------------------- #
 def train(data):
@@ -788,8 +848,7 @@ def train(data):
         ctx, tgt, extra, tgt2 = data.sample_windows(BATCH, rng)
         t = torch.rand(BATCH, device=DEVICE)
         eps = torch.randn_like(tgt)
-        z_t = (1 - t.view(-1, 1, 1, 1)) * eps + t.view(-1, 1, 1, 1) * tgt
-        v_target = tgt - eps
+        z_t = _make_zt(t, tgt, eps)
         ctx_aug = augment_context(ctx, model=model, extra=extra, training=True)
         # classifier-free guidance: per-sample context dropout (train unconditional path)
         if UNCOND_PROB > 0:
@@ -798,12 +857,8 @@ def train(data):
                 ctx_aug = ctx_aug.clone()
                 ctx_aug[drop] = 0.0
         with _amp():
-            v_pred = model.get_velocity(z_t, ctx_aug, t)
-            # inverse-conditional-variance weight 1/(1-t)^2 clamped (RF x-pred)
-            w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
-            loss_vel = ((v_pred - v_target) ** 2).mean(dim=(1, 2, 3)) * w
-            x_pred = model.forward(z_t, ctx_aug, t)
-            loss = loss_vel.mean().float() + extra_loss(x_pred.float(), tgt.float()).float()
+            loss_vel, x_pred = _flow_loss_term(model, z_t, tgt, ctx_aug, t, eps)
+            loss = loss_vel + extra_loss(x_pred.float(), tgt.float()).float()
         # multi-step rollout loss: predict tgt2 from [ctx[:,1], model_pred(tgt)],
         # training the model to stay consistent when its own output is fed back.
         if TECHNIQUE in ("selffeed_ms", "selffeed_msgate", "vae_ms", "manifold_ms") and MS_PROB > 0 and rng.rand() < MS_PROB:
@@ -834,12 +889,9 @@ def train(data):
             ctx2_aug = augment_context(ctx2, model=model, extra=extra, training=True)
             t2 = torch.rand(BATCH, device=DEVICE)
             eps2 = torch.randn_like(tgt2)
-            z_t2 = (1 - t2.view(-1, 1, 1, 1)) * eps2 + t2.view(-1, 1, 1, 1) * tgt2
-            v_target2 = tgt2 - eps2
+            z_t2 = _make_zt(t2, tgt2, eps2)
             with _amp():
-                v_pred2 = model.get_velocity(z_t2, ctx2_aug, t2)
-                w2 = (1.0 / (1.0 - t2).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
-                loss_ms = (((v_pred2 - v_target2) ** 2).mean(dim=(1, 2, 3)) * w2).mean().float()
+                loss_ms, _ = _flow_loss_term(model, z_t2, tgt2, ctx2_aug, t2, eps2)
             loss = loss + MS_WEIGHT * loss_ms
         opt.zero_grad()
         loss.backward()
@@ -856,6 +908,46 @@ def train(data):
 # 5. SAMPLING & ROLLOUT
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
+def _ode_integrate(model, z0, ctx_aug, n_ode, g):
+    """Integrate the flow ODE 0->1 from the noise source z0 (B',C,H,W).
+    RF:     forward-Euler  v=(x_pred-z)/(1-t)  (+ optional CFG + stochastic re-noise).
+    Bridge: closed-form step  z(t+dt) = mu_next + (z-mu_t)*c(t+dt)/c(t), with
+            mu_t = (1-t)eps + t x_pred. Absorbs the stiff c'/c mean-reversion into
+            the O(1) ratio c(t+dt)/c(t); lands exactly on x_pred at t=1 (endpoint
+            variance -> sigma_min^2 ~ 0, so nothing off-manifold is fed forward).
+            CFG (g!=1) is RF-only (bridge has no velocity to interpolate)."""
+    Bn = z0.shape[0]
+    z = z0
+    dt = 1.0 / n_ode
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        if FLOW == "bridge":
+            eps_fixed = z0
+            for i in range(n_ode):
+                t_val = i * dt
+                t_next = t_val + dt
+                t = torch.full((Bn,), t_val, device=DEVICE)
+                x_pred = model.forward(z, ctx_aug, t).float()
+                mu_t = (1.0 - t_val) * eps_fixed + t_val * x_pred
+                mu_next = (1.0 - t_next) * eps_fixed + t_next * x_pred
+                c_t, _ = bridge_coeffs(t_val, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+                c_next, _ = bridge_coeffs(t_next, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+                ratio = c_next / c_t                       # 0-dim tensor, broadcasts
+                z = mu_next + (z - mu_t) * ratio
+        else:
+            for i in range(n_ode):
+                t = torch.full((Bn,), i * dt, device=DEVICE)
+                v = model.get_velocity(z, ctx_aug, t)
+                if g != 1.0:
+                    v_u = model.get_velocity(z, torch.zeros_like(ctx_aug), t)
+                    v = v_u + g * (v - v_u)
+                z = z + v * dt
+                if NOISE_INJECT > 0:
+                    remaining = max(0.0, 1.0 - (i + 1) * dt)
+                    z = z + NOISE_INJECT * math.sqrt(dt) * remaining * torch.randn_like(z)
+    return z
+
+
+@torch.no_grad()
 def sample_step(model, ctx, n_ode, guidance=None, n_samples=None):
     """Sample one frame (B,C,H,W) from context ctx (B,K,C,H,W).
     guidance=None -> use global GUIDANCE (inference); pass 1.0 to disable (training).
@@ -863,41 +955,15 @@ def sample_step(model, ctx, n_ode, guidance=None, n_samples=None):
     n_samples = SAMPLE_AVG if n_samples is None else n_samples
     g = GUIDANCE if guidance is None else guidance
     B = ctx.shape[0]
+    ctx_aug = augment_context(ctx, training=False)
     if n_samples > 1:
         # replicate contexts across N noise samples, integrate together, average
-        ctx_aug = augment_context(ctx, training=False)
         ctx_rep = ctx_aug.repeat_interleave(n_samples, dim=0)  # B*N,K,C,H,W
-        z = torch.randn(B * n_samples, C_CHAN, IMG, IMG, device=DEVICE)
-        dt = 1.0 / n_ode
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            for i in range(n_ode):
-                t = torch.full((B * n_samples,), i * dt, device=DEVICE)
-                v = model.get_velocity(z, ctx_rep, t)
-                if g != 1.0:
-                    v_u = model.get_velocity(z, torch.zeros_like(ctx_rep), t)
-                    v = v_u + g * (v - v_u)
-                z = z + v * dt
-                if NOISE_INJECT > 0:
-                    remaining = (1.0 - (i + 1) * dt).clamp(min=0.0)
-                    z = z + NOISE_INJECT * math.sqrt(dt) * remaining * torch.randn_like(z)
-        z = z.view(B, n_samples, C_CHAN, IMG, IMG).mean(dim=1)  # average over samples
-        return z.float()
-    z = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
-    dt = 1.0 / n_ode
-    ctx_aug = augment_context(ctx, training=False)
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        for i in range(n_ode):
-            t = torch.full((B,), i * dt, device=DEVICE)
-            v = model.get_velocity(z, ctx_aug, t)
-            if g != 1.0:
-                v_u = model.get_velocity(z, torch.zeros_like(ctx_aug), t)
-                v = v_u + g * (v - v_u)
-            z = z + v * dt
-            if NOISE_INJECT > 0:
-                # stochastic sampler: re-noise proportional to remaining noise level (1-(t+dt))
-                remaining = (1.0 - (i + 1) * dt).clamp(min=0.0)
-                z = z + NOISE_INJECT * math.sqrt(dt) * remaining * torch.randn_like(z)
-    return z.float()
+        z0 = torch.randn(B * n_samples, C_CHAN, IMG, IMG, device=DEVICE)
+        z = _ode_integrate(model, z0, ctx_rep, n_ode, g)
+        return z.view(B, n_samples, C_CHAN, IMG, IMG).mean(dim=1).float()
+    z0 = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
+    return _ode_integrate(model, z0, ctx_aug, n_ode, g).float()
 
 
 @torch.no_grad()
@@ -1001,7 +1067,8 @@ def main():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     print(f"TECHNIQUE={TECHNIQUE} SIGMA={SIGMA} BLUR_SIGMA={BLUR_SIGMA} "
-          f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} ARCH={ARCH} device={DEVICE}", flush=True)
+          f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} ARCH={ARCH} FLOW={FLOW} "
+          f"BRIDGE_SIGMA={BRIDGE_SIGMA} BRIDGE_WCLAMP={BRIDGE_WCLAMP} device={DEVICE}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,
