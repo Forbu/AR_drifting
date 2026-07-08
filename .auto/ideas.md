@@ -483,3 +483,37 @@ multichannel (production-relevant: user's model is 4ctx->3fut multichannel). ED 
 here likely because C=2's failure mode is under-fit/blur (different from C=1 overshoot);
 ctx_bridge sharpens without moving the position-dominated ED much. Did NOT tune magnitude
 for C=2 (overfitting frontier) — production should re-tune magnitude per channel-set.
+
+### STRUCTURAL VARIANTS — all FALSIFIED (champion design confirmed) (2026-07-08)
+- ~~K=3 + ctx_bridge synergy~~: FALSIFIED. K=3+ctx_bridge ED 1246 >> K=2+ctx_bridge 792.
+  Extra context frame adds divergence the small gaussian can't tame. K=2 optimal.
+- ~~ctx_bridge at K=3~~: HURTS (K=3 none 1016 < K=3 ctx_bridge 1246) — OPPOSITE of K=2.
+  Mechanism refined: ctx_bridge benefit is K-DEPENDENT. Helps when context is SCARCE
+  (K=2, model over-relies on the few drifted frames -> mean-regression blur); with more
+  context (K=3) the model is naturally robust and the noise is pure degradation.
+- ~~LAST_ONLY=0 (corrupt BOTH context frames)~~: WORSE (ED 917 > 792, mass 0.029>0.005).
+  Older frame[0] is CLEAN in training; corrupting it degrades the dynamics signal the
+  model needs. Last-frame-only confirmed optimal for gaussian too (matches manifold).
+
+### COMPOUNDING TEST — ctx_bridge is an ACCELERATOR, NOT a compounder (2026-07-08)
+Matched-compute comparison @dt=0.024 S0:
+| TRAIN_STEPS | none ED | ctx_bridge ED | winner        |
+|-------------|---------|---------------|---------------|
+| 4500        | 951     | 792           | ctx -16.7%    |
+| 6000        | 646     | 755           | none -14.2%   |
+KEY: ctx_bridge's advantage REVERSES with more training. At 4500 it wins big; by 6000
+the base model has learned robust dynamics alone and the context noise becomes a pure
+tax (only mass stays better: ctx 0.0016 vs none 0.017). So ctx_bridge is a COMPUTE-
+EFFICIENT ACCELERATOR (gets you to good rollout stability faster at moderate budget),
+NOT a self-feed-style compounder (which widened its lead with training). Static regularizer
+the model outgrows — same class as manifold_noise (which plateaued), NOT selffeed.
+NOTE: none@6000 ED 646 is achievable in-budget (~207s) but it's a "train more" result,
+not a technique. At MATCHED compute, ctx_bridge only wins at moderate budget (<=4500).
+
+### PRODUCTION RECOMMENDATION (refined)
+- ctx_bridge = add N(0,~0.06) to the most-recent context frame, train-only, decoupled infer.
+- Use it when COMPUTE IS LIMITED (moderate training budget) and dynamics are drift-prone
+  (fast/hard). It accelerates reaching stable rollout (cures early blur + mass drift).
+- If you can train LONGER, the benefit fades — the base model learns robustness on its own.
+  Don't expect it to compound like scheduled sampling; it's a bootstrap regularizer.
+- The magnitude (~0.06) and last-frame-only are load-bearing; K=2 is where it helps.
