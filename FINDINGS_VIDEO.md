@@ -449,6 +449,23 @@ bridge+none 1103). The bridge ALREADY regularizes the target via mid-path Browni
 noise + clean endpoint; adding context aug is redundant/conflicting. Use ONE, not
 both. (For the bridge, no context aug = TECHNIQUE=none is best.)
 
+### ctx_bridge: Gaussian context aug DOES help the bridge — in the DRIFT regime (2026-07-08)
+UPDATE: the above "no context aug is best" holds for blur-based aug (manifold_noise)
+but NOT for small-magnitude gaussian noise. TECHNIQUE=ctx_bridge adds gaussian noise
+(std~0.06, last context frame only) whose std optionally follows the bridge variance
+schedule c_s^2=sigma^2 s(1-s)+sigma_min^2. Cross-seed 2x2 @dt=0.024 (drift regime):
+baseline none avg ED 1097/sharp0.90/mass0.067 -> ctx_bridge avg ED ~940 (-14%),
+sharp ~1.04, mass ~0.016. HEADLINE: at the hard S2 seed (baseline blurry sharp 0.78,
+mass drift 0.125) it CURES blur (sharp->1.04) and mass drift (->0.02). ABLATION:
+the bridge SCHEDULE is NOT the active ingredient — flat gaussian at matched magnitude
+is comparable (schedule choice flips S0/S2 = within noise). It's the MAGNITUDE (~std
+0.06) that matters. REGIME-DEPENDENT (correct behavior): helps ONLY where AR drift
+exists (dt=0.024); neutral-to-worse at dt=0.012 (easy, no drift). Why it works where
+manifold_noise/latent-corrupt/pixnoise all failed: SMALL magnitude + last-frame-only
++ the bridge already handles endpoint drift, leaving only residual per-step drift.
+For production: add N(0,~0.06) to the most-recent context frame at TRAIN time
+tune the magnitude to the model's per-step rollout error); decouple (clean ctx) at inference.
+
 ### Recommendation
 The bridge is **NOT a universal win over RF**. It's competitive on quality where RF
 is already good, and dramatically better where RF is unstable (fast/hard dynamics).

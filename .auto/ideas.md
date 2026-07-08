@@ -410,3 +410,67 @@ ED 1174/ed_late 1222/sharp 1.06/mass 0.025 (dt=0.012).
   Niche; the 2.8x win over RF at dt=0.024 already demonstrated the mechanism.
 - Bridge on C_CHAN=2 multichannel (more production-like; bridge may help more).
 - Stratified t sampling (user ref 32-bin) for better t coverage — minor.
+
+## 2026-07-08 session: Gaussian/Brownian-bridge CONTEXT augmentation (ctx_bridge) — WIN
+
+### USER HYPOTHESIS (validated): add a gaussian bridge to the context information
+Bridge champion (FLOW=bridge + TECHNIQUE=none + jit3d 800k/PHW8) regularizes the
+TARGET path. User asked: also corrupt the CONTEXT with bridge-shaped gaussian noise
+to robustify AR rollout. Implemented TECHNIQUE=ctx_bridge: noise std follows the
+SAME bridge variance schedule c_s^2 = sigma^2 s(1-s) + sigma_min^2 (or flat/uniform,
+or peak). CTX_BRIDGE_LAST_ONLY=1 corrupts only the most-recent context frame (the
+slot holding the model's own output at inference). Decoupled (clean ctx) at inference.
+
+### RESULT: gaussian context noise HELPS where AR drift exists (robust, cross-seed)
+Cross-seed 2x2 at dt=0.024 (drift regime), TRAIN_STEPS=4500, jit3d 800k/PHW8:
+| config               | S0 ED | S2 ED | avg ED | avg sharp | avg mass |
+|----------------------|-------|-------|--------|-----------|----------|
+| baseline none        | 951   | 1242  | 1097   | 0.90      | 0.067    |
+| bridge-sched sample  | 855   | 1009  | 932    | 1.05      | 0.018    |
+| flat gaussian std.06 | 792   | 1097  | 945    | 1.03      | 0.014    |
+Both techniques robustly beat baseline ~14% avg ED. HEADLINE: at the HARD S2 seed
+(baseline blurry sharp 0.78, mass drift 0.125), ctx_bridge CURES blur (sharp->1.04+)
+and mass drift (->0.02) — exactly the AR-stability failure modes the project targets.
+
+### KEY ABLATION: bridge SCHEDULE is NOT the active ingredient — MAGNITUDE is
+Flat/uniform gaussian at MATCHED magnitude (std~0.06) BEATS bridge-scheduled sample
+mode at S0 (792<855) but LOSES at S2 (1097>1009). The flip = overfitting-frontier
+signature => schedule choice is within seed noise. Mechanism: sample mode gives a wide
+variance range (many samples get near-zero noise at s~0,1 = under-regularized);
+flat gaussian applies consistent reg to every sample. ROBUST finding: it's the
+gaussian noise MAGNITUDE (~std 0.06 on the last ctx frame) that matters, not the
+bridge shape. For production: just add N(0, ~0.06) to the most-recent context frame.
+NOTE this is much smaller than the pixnoise that failed (std 0.4 on all frames).
+
+### REGIME-DEPENDENT (correct robustness-mechanism behavior)
+- dt=0.024 (fast/hard, AR drift exists): HELPS robustly (-14% avg ED, cures blur/mass).
+- dt=0.012 (easy, minimal drift): NEUTRAL-to-worse (0.3 neutral, 0.5 neutral-ED but
+  worse ed_late, 1.0 worse). No drift to fix => noise is pure late-rollout tax.
+This is the RIGHT behavior: a robustness mechanism should help only where the failure
+mode exists. Do NOT apply ctx_bridge at slow/easy regimes.
+
+### CHAMPION (committed): ctx_bridge uniform flat gaussian, std~0.06, last-frame-only,
+dt=0.024. Best single (792 S0) + most robust on mass (trustworthy metric). Bridge-
+scheduled sample mode (scale=0.5) is comparable and matches target's noise shape
+(the user's literal idea) — also validated. run.env restored to flat-gaussian champion.
+
+### CLOSED (do not retry without new reason)
+- ~~scale sweep @dt=0.024 S0~~: U-shape 0.3->866, 0.5->855, 0.7->974(artifacts). Opt ~0.5.
+- ~~bridge vs flat schedule~~: within seed noise (no robust winner); magnitude is key.
+- ~~dt=0.012~~: neutral-to-worse across all magnitudes (no drift). Don't apply here.
+
+### PRODUCTION RECOMMENDATION (for the user's 4ctx->3fut weather bridge model)
+- ADD input-space gaussian noise to the most-recent context frame(s) at training time,
+  magnitude ~std 0.06 in frame-std units (validate/tune on a well-trained checkpoint).
+- The bridge schedule is NOT required — flat gaussian is simpler and comparable. Match
+  the magnitude to the model's actual per-step rollout error (larger error => more noise).
+- Decouple at inference (clean context). Monitor rollout sharpness + mass/energy drift.
+- This is the FIRST input-space context-aug that helps the bridge forecaster (prior:
+  manifold_noise/blur CONFLICTED, latent corruption COLLAPSED, pixnoise FAILED).
+  Why it works where others didn't: SMALL magnitude + last-frame-only + bridge flow
+  already handles endpoint drift, leaving only residual per-step drift to address.
+
+### REMAINING (low priority — avoid overfitting frontier)
+- Magnitude finer-tune is seed-noise now (overfitting frontier reached for this knob).
+- ctx_bridge + more context (K_CTX=3/4): untested; more context may change drift profile.
+- Flat gaussian at dt=0.012 with a TINY magnitude (<0.03): marginal, likely neutral.
