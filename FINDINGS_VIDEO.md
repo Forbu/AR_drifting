@@ -533,10 +533,12 @@ clean context); the context-gen head is a training-only auxiliary.
 |---|---|---|---|
 | SEED=0 @4500/220 | 951 | **642** | **-32%** |
 | SEED=1 @4500/220 | 1220 | **669** | **-45%** |
+| SEED=2 @4500/220 (hard) | 1242 | **1038** | **-16%** |
 | SEED=0 @6000/500 | 634 | **477** | **-25%** |
 
-The technique's relative advantage is stable (~25-45%) across seeds AND compute
-levels — it is NOT a single-seed artifact or a compute proxy.
+The technique wins on ALL 3 seeds (16-45%) AND at higher compute (-25%) — it is NOT a
+single-seed artifact or a compute proxy. On the hard SEED=2 the win is smaller and the
+champion is blurrier than the baseline there (sharp 0.71 vs 0.78), but ED still wins.
 
 ### HONEST TRADEOFF (important for production)
 The champion trades **per-frame sharpness** (0.84-0.95 vs baseline's ~1.0) and
