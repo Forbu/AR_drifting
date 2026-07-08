@@ -536,3 +536,82 @@ Magnitude (0.06 optimal, U-shape), schedule (flat≈bridge, within noise), K (K=
 hurts K=3), frames (last-only optimal), compounding (accelerator not compounder, reverses
 >6000), anneal (dead), regime (helps dt=0.024, neutral dt=0.012), multichannel (soft
 positive). CHAMPION: static flat gaussian std~0.06, last-frame-only, K=2, @4500 drift regime.
+
+## 2026-07-08 session: RANDOM non-conditional pixel-noise sigma on context (ctx_bridge TIME=randsigma)
+
+### USER HYPOTHESIS (the literal request this session)
+User asked: add RANDOM (non-conditional) gaussian/pixel noise on the context = `ctx += sigma*eps`
+with `sigma ~ U(0,1)` per sample (the noise STD itself sampled uniformly, NOT tied to the
+bridge schedule t). This is a flow/diffusion-style forward process applied to the CONTEXT.
+Implemented as `CTX_BRIDGE_TIME=randsigma` in augment_context (video_rollout_experiment.py,
+JiT-3D backbone + Brownian-bridge target flow). NOTE: this is PLAIN PIXEL NOISE with random
+scale — not "bridge" noise on context (user clarified). It reuses the ctx_bridge plumbing.
+
+### MAGNITUDE SWEEP (SCALE = upper bound of sigma~U(0,SCALE); mean std = SCALE/2)
+U-shape, optimum at SCALE=0.1 (mean std 0.05). @4500/220 SEED=0 dt=0.024:
+| SCALE | mean std | ED    |
+|-------|----------|-------|
+| 0.05  | 0.025    | 914   |
+| 0.1   | 0.05     | 875   | <- optimum (beats baseline 951)
+| 0.15  | 0.075    | 1052  |
+| 0.2   | 0.10     | 1051  |
+| 1.0   | 0.50     | 1223  | (over-corrupts: mass 0.098, sharp 1.14 overshoot)
+Literal `sigma~U(0,1)` (SCALE=1.0) over-corrupts — high-sigma samples destroy mass.
+Magnitude ~0.05 mean matches the prior flat-gaussian champion (fixed std 0.06). KEY: the
+random SPREAD (many near-zero samples) slightly under-regularizes vs fixed-flat, so the
+optimum mean (0.05) is a touch below flat's (0.06).
+
+### THE CORE FINDING: randsigma is a REGIME-DEPENDENT ROBUSTNESS MECHANISM
+It is NOT a universal win. It is a TAX where the base model is already good and a CURE
+where the base model FAILS. Cross-seed @6000/500 dt=0.024:
+| config            | S0 ED | S2 ED | avg ED | avg sharp | avg mass |
+|-------------------|-------|-------|--------|-----------|----------|
+| none (base)       | 634   | 862   | 748    | 0.91      | 0.063    |
+| randsigma SCALE=.1| 789   | 763   | 776    | 1.00      | 0.024    |
+- SEED=0 (lucky/easy): base already sharp(1.00)/stable(0.0075) -> noise is a TAX (789>634).
+- SEED=2 (hard): base FAILS blurry (sharp 0.82, mass 0.119) -> noise CURES it (sharp 0.95,
+  mass 0.028, 4x; ED 763<862 -11.5%). EXACTLY the AR-stability failure mode the project targets.
+- Cross-seed ED ties (~4%, within noise); QUALITY favors randsigma (avg sharp 1.00 vs 0.91,
+  avg mass 0.024 vs 0.063). It is robustness INSURANCE: small cost on easy seeds, prevents
+  catastrophic failure on hard seeds. Same class/mechanism as flat-gaussian ctx_bridge
+  (validated SEED=2 cure earlier this week).
+
+### COMPUTE / DATA SCALING (user's 'train longer + bigger dataset' directive)
+Sweet spot at none@6000 steps/500 traj (~15 epochs) = ED 634 (S0) / 862 (S2). NON-monotonic:
+| config          | epochs | ED (S0) | note                       |
+|-----------------|--------|---------|----------------------------|
+| none 4500/220   | 25     | 951     | undertrained-ish (orig)    |
+| none 6000/500   | 15     | 634     | <- SWEET SPOT              |
+| none 6000/1000  | 7      | 787     | UNDERTRAINS (blur 0.91)    |
+| none 9000/750   | 15     | 877     | OVERTRAINS (train_loss 1.8e-5 tiny, rollout degrades; sharp 1.08 overshoot) |
+LESSONS: (1) bigger dataset at fixed compute UNDERTRAINS (7 epochs) -> blur/mass-drift.
+Needs proportionally more compute (confirms prior '2k needs ~9x compute'). (2) MORE STEPS
+past ~6000 OVERTRAINS the ViT on bridge+vloss (low train_loss but worse AR rollout drift) —
+the 1/(1-t c'/c)^2 weighting accumulates instability. (3) 6000/500 is the practical optimum:
+enough epochs to learn, not so many steps it overfits/destabilizes.
+
+### PRODUCTION RECOMMENDATIONS (this session)
+- RANDOM pixel noise on context (sigma~U(0,~0.1), mean std ~0.05) is a valid ROBUSTNESS aug
+  for AR forecasters prone to blur/mass-drift. It is regime-dependent: use it when the model
+  is drift-prone (hard data, unlucky init, limited compute); SKIP it when the model is already
+  stable (it's then a pure tax). For a production model you can't seed-tune, it is cheap
+  insurance against catastrophic AR failure.
+- Do NOT expect it to compound like scheduled sampling — like all static context corruption
+  tested here, the base model outgrows it at high compute on easy regimes. Its value is
+  failure-mode prevention, not ED improvement on already-good models.
+- Compute/data: scale them TOGETHER (keep ~15 epochs). Bigger data alone at fixed steps
+  undertrains; more steps alone past ~6000 overtrains this ViT+bridge+vloss combo.
+
+### CHAMPION / run.env
+- Best single metric: none@6000/500 SEED=0 = ED 634 (but SEED-LUCKY; SEED=2 base fails at 862).
+- Technique (randsigma SCALE=0.1) is the robustness recommendation; not the ED champion on
+  lucky seeds. run.env currently holds the SEED=0 none champion (best metric).
+
+### REMAINING (low priority)
+- ~~randsigma@4500/220 SEED=2~~: ANSWERED. Cure IS compute-robust. none@4500/220 SEED=2
+  FAILS (ED 1242, sharp 0.78, mass 0.125); randsigma CURES (947, sharp 1.00, mass 0.003).
+  Completes 2x2 at moderate compute: randsigma wins BOTH seeds (S0 875<951, S2 947<1242;
+  avg 911 vs 1097, -17%). The SEED=2 failure is robust across compute (4500/220: none 1242;
+  6000/500: none 862) and NOT compute-fixable alone; randsigma cures it at both levels.
+- A smaller SCALE (0.03-0.05) at HIGH compute (6000/500) might reduce the SEED=0 tax while
+  keeping partial SEED=2 cure -> could win the @6000/500 cross-seed tie. Low prior.
