@@ -473,3 +473,87 @@ For production: use the bridge if your dynamics are fast/unstable or you observe
 rollout artifacts / mass drift; otherwise a well-tuned RF is fine. The `vloss`
 loss is required (uniform collapses on easy data; the `(1-t c'/c)^2` one-sided
 data-end upweight prevents collapse while being a genuine velocity loss).
+
+## Joint context-generation + future-prediction objective (2026-07-08)
+
+**Question (user):** Instead of denoising only the future, train the net to JOINTLY
+(a) DENOISE the context frames (learn to generate valid data from scratch) AND
+(b) PREDICT the future frame. Input: `[noisy-context..., noisy-future]` ->
+`[clean-context..., clean-future]`. Context via one interpolant, future via the
+Brownian bridge. Hypothesis: the generative prior + training on (lightly) noised
+context robustifies AR rollout. Inference rollout is UNCHANGED (predict future from
+clean context); the context-gen head is a training-only auxiliary.
+
+### Implementation (`video_rollout_experiment.py`, JOINT_GEN=1, jit3d only)
+- `VideoRFJiT3D.forward_joint()` returns clean-frame predictions for ALL K context
+  slots AND the future slot (the net already predicts the full volume; we keep both).
+- Context-slot interpolant via `JOINT_CTX_FLOW` (`rf` linear | `bridge`). Future via
+  the bridge (as before). Context time `s` biased closer to data than future `t`
+  (`s=min(1,t+JOINT_LEAD)`, "generate data first, then predict").
+- `JOINT_DECOUPLE=1` passes BOTH times to the net (context_dim=2; last-only) or all
+  per-frame times (context_dim=K+1; graded). At inference the context is clean so its
+  time(s)=1.
+- Loss = `bridge_loss(future) + JOINT_CTX_WEIGHT * ctx_recon_loss(context)`.
+
+### Results (jit3d-128/4/4 PHW8, SEED=0, dt=0.024, 4500 steps/220 traj, deterministic)
+
+| config | rollout_ed | ed_late | sharp | mass | note |
+|---|---|---|---|---|---|
+| baseline (JOINT_GEN=0, bridge+none) | 951 | 1002 | 1.02 | 0.009 | reference |
+| joint RF-ctx, ALL slots, w=1.0 | 1141 | 1091 | 0.89 | 0.047 | noising BOTH slots kills dynamics |
+| joint RF-ctx, LAST_ONLY, lead0.3 | 766 | 707 | 0.80 | 0.10 | WIN: noise only the drift-prone recent slot |
+| joint RF-ctx, LAST_ONLY, lead0.5 | 755 | 806 | 0.85 | 0.082 | gentler recent-slot noise |
+| joint bridge-ctx sigma=0.3, LAST_ONLY | 1195 | 1485 | 0.85 | 0.13 | bridge sigma too big (extra noise) |
+| **joint bridge-ctx sigma=0.1, LAST_ONLY, decouple=1** | **642** | 717 | **0.95** | 0.078 | **CHAMPION @4500/220** |
+
+### KEY FINDINGS
+1. **LAST_ONLY is essential** (noise only the most-recent context slot, keep the
+   older dynamics-bearing slot CLEAN). Noising all slots (1141/895/767) is always
+   worse than last-only (642). Reason: the bridge needs a clean dynamics anchor;
+   the recent slot is the one that holds the model's own (drifted) output at inference
+   — noising exactly that slot matches the rollout drift. (Same lesson as ctx_bridge.)
+2. **Bridge context with SMALL sigma (0.1) >> RF context (755) >> bridge sigma 0.3 (1195).**
+   The user's "bridge for both" intuition is CORRECT but context sigma must be small.
+   Sigma sweep: 0.05->732, **0.1->642 (peak)**, 0.15->855, 0.3->1195 (inverted-U).
+   Mechanism: the bridge's clean-endpoint landing + one-sided vloss weight forces
+   SHARP data-end reconstruction (fixes the RF variant's mean-pull blur: sharp
+   0.85->0.95). Too-large sigma adds extra mid-path Brownian noise that degrades the
+   future-prediction conditioning.
+3. **DECOUPLE=1 (pass the context time to the net) beats DECOUPLE=0** (642 vs 824).
+   The model benefits from knowing the noised slot's noise level. (Tested; answers
+   the user's "decouple better?" question — NO, decouple=1 is better.)
+4. **GRADED per-frame context times (all frames, newest noisiest->oldest cleanest) is
+   DOMINATED by last-only** (graded+dec1=895, graded+dec0=767 vs last-only+dec1=642).
+   The "degrading information" intuition is half-right (newest frame SHOULD be
+   noisiest — last-only does this) but noising the clean dynamics anchor, even
+   lightly, hurts. Keep it fully clean.
+
+### CROSS-SEED VALIDATION (anti-overfit) — the win GENERALIZES
+| seed | baseline (JOINT_GEN=0) | champion (bridge-ctx 0.1, last-only) | delta |
+|---|---|---|---|
+| SEED=0 @4500/220 | 951 | **642** | **-32%** |
+| SEED=1 @4500/220 | 1220 | **669** | **-45%** |
+| SEED=0 @6000/500 | 634 | **477** | **-25%** |
+
+The technique's relative advantage is stable (~25-45%) across seeds AND compute
+levels — it is NOT a single-seed artifact or a compute proxy.
+
+### HONEST TRADEOFF (important for production)
+The champion trades **per-frame sharpness** (0.84-0.95 vs baseline's ~1.0) and
+**mass_drift** (0.08-0.14 vs baseline's ~0.008) for much better POSITIONAL rollout
+stability (ED -25 to -45%). The ED improvement is driven by the pooled/position
+features (the blob stays closer to the correct position over long rollouts) — it is
+NOT blur-hiding (the baseline is sharp-but-drifty at ED 634; the champion is
+stable-but-blurry at ED 477). The blur is an inherent cost of training on noised
+context (the model learns to average over the uncertain recent-slot position). The
+**mass_drift is a genuine amplitude-error downside** worth monitoring in production.
+The 4500/220 config (sharp 0.95) is a better quality/stability tradeoff than 6000/500
+(sharp 0.84) — pushing ED lower with more compute comes at sharpness cost.
+
+### Champion config
+```
+JOINT_GEN=1 JOINT_CTX_FLOW=bridge JOINT_CTX_BRIDGE_SIGMA=0.1 JOINT_CTX_BRIDGE_SIGMA_MIN=1e-3
+JOINT_LAST_ONLY=1 JOINT_LEAD=0.5 JOINT_COUPLE=1 JOINT_DECOUPLE=1 JOINT_CTX_WEIGHT=1.0
+FLOW=bridge BRIDGE_LOSS=vloss BRIDGE_SIGMA=0.3 BRIDGE_WCLAMP=10
+ARCH=jit3d (128/4/4, PHW8) TRAIN_STEPS=4500 SEED=0 LORENZ_DT=0.024
+```
