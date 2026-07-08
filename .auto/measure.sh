@@ -1,5 +1,5 @@
 #!/bin/bash
-# Autoresearch benchmark: BLOCK-BRIDGE flow matching (3-frame -> 3-frame).
+# Autoresearch benchmark: VIDEO rollout stability (JiT-3D + Brownian-bridge flow).
 # Emits METRIC name=value lines. Primary: rollout_ed (lower=better).
 # Hyperparams read from .auto/run.env (written each iteration).
 set -euo pipefail
@@ -10,4 +10,4 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8  # required by torch deterministic algori
 set -a
 [ -f .auto/run.env ] && source .auto/run.env
 set +a
-python block_bridge_experiment.py 2>&1
+python video_rollout_experiment.py 2>&1

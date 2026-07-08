@@ -141,7 +141,7 @@ BRIDGE_LOSS     = os.environ.get("BRIDGE_LOSS", "vloss")   # bridge loss: "vloss
 CTX_BRIDGE_SIGMA     = _env("CTX_BRIDGE_SIGMA", BRIDGE_SIGMA, float)   # context bridge perturbation scale (var at s=0.5 = sigma^2/4)
 CTX_BRIDGE_SIGMA_MIN = _env("CTX_BRIDGE_SIGMA_MIN", BRIDGE_SIGMA_MIN, float)  # context bridge residual endpoint std
 CTX_BRIDGE_SCALE     = _env("CTX_BRIDGE_SCALE", 1.0, float)   # overall multiplier on the context bridge noise std (sweep magnitude)
-CTX_BRIDGE_TIME      = os.environ.get("CTX_BRIDGE_TIME", "sample")  # "sample" (s~U(0,1), full bridge variance range) | "peak" (fixed s=0.5, max variance) | "uniform" (plain gaussian std=CTX_BRIDGE_SIGMA*SCALE, isolates the schedule effect)
+CTX_BRIDGE_TIME      = os.environ.get("CTX_BRIDGE_TIME", "sample")  # "sample" (s~U(0,1), full bridge variance range) | "peak" (fixed s=0.5, max variance) | "uniform" (plain gaussian std=CTX_BRIDGE_SIGMA*SCALE, isolates the schedule effect) | "randsigma" (random NON-CONDITIONAL sigma~U(0,SCALE) per sample; noise std itself uniform, not bridge-schedule)
 CTX_BRIDGE_LAST_ONLY = _env("CTX_BRIDGE_LAST_ONLY", 1, int)  # 1=corrupt only the most-recent context frame (the slot holding the model's own output at inference); 0=all frames
 CTX_BRIDGE_ANNEAL   = _env("CTX_BRIDGE_ANNEAL", 0.0, float)  # >0: linearly decay the context noise magnitude to 0 over this fraction of training (e.g. 0.8 -> noise off by 80% of TRAIN_STEPS, clean refinement after). Rationale: ctx_bridge is an accelerator the model outgrows; annealing captures early-regularization benefit while avoiding the late tax. 0=off (static)
 # --- Flow SOURCE (t=0 endpoint of the interpolation) ---
@@ -653,6 +653,13 @@ def augment_context(ctx, model=None, extra=None, training=True):
         elif CTX_BRIDGE_TIME == "uniform":
             # ablation: plain gaussian (no bridge schedule), isolates the schedule effect
             std = CTX_BRIDGE_SIGMA * CTX_BRIDGE_SCALE * decay
+        elif CTX_BRIDGE_TIME == "randsigma":
+            # random NON-CONDITIONAL sigma: the noise std itself is sampled uniformly
+            # per sample in [0, CTX_BRIDGE_SCALE] (NOT tied to the bridge schedule t).
+            # Implements ctx += sigma*eps with sigma~U(0,SCALE), eps~N(0,1) — a flow/
+            # diffusion forward process on the CONTEXT. Unlike 'sample' (bridge-shaped,
+            # max ~sigma/2) this hits the FULL [0,SCALE] range incl. large corrupts.
+            std = (torch.rand(B, device=ctx.device) * CTX_BRIDGE_SCALE * decay).view(B, 1, 1, 1, 1)
         else:  # "sample" — full bridge variance range per sample
             s = torch.rand(B, device=ctx.device)
             var = CTX_BRIDGE_SIGMA ** 2 * s * (1.0 - s) + CTX_BRIDGE_SIGMA_MIN ** 2
