@@ -1,7 +1,7 @@
 #!/bin/bash
-# Autoresearch benchmark: 2D-video rollout stability for rectified-flow forecasters.
-# Emits METRIC name=value lines. Primary: rollout_mmd (lower=better).
-# Technique + hyperparams are read from .auto/run.env (written each iteration).
+# Autoresearch benchmark: BLOCK-BRIDGE flow matching (3-frame -> 3-frame).
+# Emits METRIC name=value lines. Primary: rollout_ed (lower=better).
+# Hyperparams read from .auto/run.env (written each iteration).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
@@ -10,4 +10,4 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8  # required by torch deterministic algori
 set -a
 [ -f .auto/run.env ] && source .auto/run.env
 set +a
-python video_rollout_experiment.py 2>&1
+python block_bridge_experiment.py 2>&1

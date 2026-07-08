@@ -144,6 +144,15 @@ CTX_BRIDGE_SCALE     = _env("CTX_BRIDGE_SCALE", 1.0, float)   # overall multipli
 CTX_BRIDGE_TIME      = os.environ.get("CTX_BRIDGE_TIME", "sample")  # "sample" (s~U(0,1), full bridge variance range) | "peak" (fixed s=0.5, max variance) | "uniform" (plain gaussian std=CTX_BRIDGE_SIGMA*SCALE, isolates the schedule effect)
 CTX_BRIDGE_LAST_ONLY = _env("CTX_BRIDGE_LAST_ONLY", 1, int)  # 1=corrupt only the most-recent context frame (the slot holding the model's own output at inference); 0=all frames
 CTX_BRIDGE_ANNEAL   = _env("CTX_BRIDGE_ANNEAL", 0.0, float)  # >0: linearly decay the context noise magnitude to 0 over this fraction of training (e.g. 0.8 -> noise off by 80% of TRAIN_STEPS, clean refinement after). Rationale: ctx_bridge is an accelerator the model outgrows; annealing captures early-regularization benefit while avoiding the late tax. 0=off (static)
+# --- Flow SOURCE (t=0 endpoint of the interpolation) ---
+# "noise" (default): Gaussian source z_0~N(0,1) -> generate target from scratch.
+# "lastctx": flow from the LAST CONTEXT FRAME -> target (delta/residual flow). The
+#   model learns the MOTION (target - last_frame) instead of generating from noise; at
+#   inference each AR step starts from the previous prediction, bounding drift accumulation.
+#   REQUIRES SRC_NOISE>0 at training (exposure-bias fix: inference source is the model's
+#   DRIFTED prediction, so the model must train on perturbed sources to not amplify drift).
+FLOW_SOURCE     = os.environ.get("FLOW_SOURCE", "noise")
+SRC_NOISE       = _env("SRC_NOISE", 0.0, float)   # lastctx: source perturbation std at TRAIN (eps=last+SRC_NOISE*randn) AND inference (per-sample diversity for SAMPLE_AVG). 0=pure deterministic (exposure-biased, unstable).
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -905,7 +914,7 @@ def train(data):
         _STEP = step
         ctx, tgt, extra, tgt2 = data.sample_windows(BATCH, rng)
         t = torch.rand(BATCH, device=DEVICE)
-        eps = torch.randn_like(tgt)
+        eps = (ctx[:, -1] + SRC_NOISE * torch.randn_like(tgt)) if FLOW_SOURCE == "lastctx" else torch.randn_like(tgt)
         z_t = _make_zt(t, tgt, eps)
         ctx_aug = augment_context(ctx, model=model, extra=extra, training=True)
         # classifier-free guidance: per-sample context dropout (train unconditional path)
@@ -946,7 +955,7 @@ def train(data):
             ctx2 = torch.stack([ctx[:, 1], pred1], dim=1)   # B,K,C,H,W
             ctx2_aug = augment_context(ctx2, model=model, extra=extra, training=True)
             t2 = torch.rand(BATCH, device=DEVICE)
-            eps2 = torch.randn_like(tgt2)
+            eps2 = (ctx2[:, -1] + SRC_NOISE * torch.randn_like(tgt2)) if FLOW_SOURCE == "lastctx" else torch.randn_like(tgt2)
             z_t2 = _make_zt(t2, tgt2, eps2)
             with _amp():
                 loss_ms, _ = _flow_loss_term(model, z_t2, tgt2, ctx2_aug, t2, eps2)
@@ -1014,13 +1023,21 @@ def sample_step(model, ctx, n_ode, guidance=None, n_samples=None):
     g = GUIDANCE if guidance is None else guidance
     B = ctx.shape[0]
     ctx_aug = augment_context(ctx, training=False)
+    last = ctx[:, -1]  # B,C,H,W — the flow source when FLOW_SOURCE=lastctx
     if n_samples > 1:
         # replicate contexts across N noise samples, integrate together, average
         ctx_rep = ctx_aug.repeat_interleave(n_samples, dim=0)  # B*N,K,C,H,W
-        z0 = torch.randn(B * n_samples, C_CHAN, IMG, IMG, device=DEVICE)
+        if FLOW_SOURCE == "lastctx":
+            src = last.repeat_interleave(n_samples, dim=0)
+            z0 = src + (SRC_NOISE * torch.randn_like(src) if SRC_NOISE > 0 else 0.0)
+        else:
+            z0 = torch.randn(B * n_samples, C_CHAN, IMG, IMG, device=DEVICE)
         z = _ode_integrate(model, z0, ctx_rep, n_ode, g)
         return z.view(B, n_samples, C_CHAN, IMG, IMG).mean(dim=1).float()
-    z0 = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
+    if FLOW_SOURCE == "lastctx":
+        z0 = last + (SRC_NOISE * torch.randn_like(last) if SRC_NOISE > 0 else 0.0)
+    else:
+        z0 = torch.randn(B, C_CHAN, IMG, IMG, device=DEVICE)
     return _ode_integrate(model, z0, ctx_aug, n_ode, g).float()
 
 
