@@ -131,6 +131,18 @@ BRIDGE_SIGMA    = _env("BRIDGE_SIGMA", 0.5, float)        # bridge: Brownian per
 BRIDGE_SIGMA_MIN = _env("BRIDGE_SIGMA_MIN", 1e-3, float) # bridge: residual endpoint variance (smaller -> sharper landing)
 BRIDGE_WCLAMP   = _env("BRIDGE_WCLAMP", 200.0, float)     # bridge: clamp on the loss weight (BRIDGE_LOSS=ivar -> 1/c_t^2; =vloss -> (1-t c'/c)^2)
 BRIDGE_LOSS     = os.environ.get("BRIDGE_LOSS", "vloss")   # bridge loss: "vloss" (velocity-matching ||v-u_t||^2 via x-pred = (x_pred-y)^2 (1-t c'/c)^2 clamped; one-sided data-end upweight, prevents collapse) | "ivar" (inverse-cond-var 1/c_t^2, upweights BOTH endpoints) | "uniform" (plain x-pred MSE; collapses to context-pred on easy data)
+# --- Context augmentation: Gaussian/Brownian-bridge-shaped perturbation on context ---
+# ctx_bridge corrupts context frames with noise whose std follows the SAME bridge
+# variance schedule used for the target: c_s^2 = sigma^2 s(1-s) + sigma_min^2.
+# Rationale: train the model on context degraded by the bridge's own noise shape so
+# it is robust to AR context drift WITHOUT the blur-collapse that killed manifold_noise
+# on bridge (bridge already regularizes the target; this matches its noise structure).
+# Inference is decoupled (clean context) per the established AR-stability principle.
+CTX_BRIDGE_SIGMA     = _env("CTX_BRIDGE_SIGMA", BRIDGE_SIGMA, float)   # context bridge perturbation scale (var at s=0.5 = sigma^2/4)
+CTX_BRIDGE_SIGMA_MIN = _env("CTX_BRIDGE_SIGMA_MIN", BRIDGE_SIGMA_MIN, float)  # context bridge residual endpoint std
+CTX_BRIDGE_SCALE     = _env("CTX_BRIDGE_SCALE", 1.0, float)   # overall multiplier on the context bridge noise std (sweep magnitude)
+CTX_BRIDGE_TIME      = os.environ.get("CTX_BRIDGE_TIME", "sample")  # "sample" (s~U(0,1), full bridge variance range) | "peak" (fixed s=0.5, max variance) | "uniform" (plain gaussian std=CTX_BRIDGE_SIGMA*SCALE, isolates the schedule effect)
+CTX_BRIDGE_LAST_ONLY = _env("CTX_BRIDGE_LAST_ONLY", 1, int)  # 1=corrupt only the most-recent context frame (the slot holding the model's own output at inference); 0=all frames
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -613,6 +625,32 @@ def augment_context(ctx, model=None, extra=None, training=True):
 
     if TECHNIQUE == "none":
         return ctx
+
+    if TECHNIQUE == "ctx_bridge":
+        # Brownian-bridge-shaped Gaussian perturbation on context frames.
+        # Noise std follows the SAME variance schedule as the target flow path:
+        #   c_s^2 = CTX_BRIDGE_SIGMA^2 * s(1-s) + CTX_BRIDGE_SIGMA_MIN^2
+        # so the model sees context degraded by the bridge's own noise shape.
+        if CTX_BRIDGE_TIME == "peak":
+            s = torch.full((B,), 0.5, device=ctx.device)
+        elif CTX_BRIDGE_TIME == "uniform":
+            # ablation: plain gaussian (no bridge schedule), isolates the schedule effect
+            std = CTX_BRIDGE_SIGMA * CTX_BRIDGE_SCALE
+            out = ctx + torch.randn_like(ctx) * std
+            if CTX_BRIDGE_LAST_ONLY and ctx.shape[1] > 1:
+                out = torch.stack([ctx[:, k] if k < ctx.shape[1] - 1 else out[:, k]
+                                       for k in range(ctx.shape[1])], dim=1)
+            return out
+        else:  # "sample" — full bridge variance range per sample
+            s = torch.rand(B, device=ctx.device)
+        var = CTX_BRIDGE_SIGMA ** 2 * s * (1.0 - s) + CTX_BRIDGE_SIGMA_MIN ** 2
+        std = (torch.sqrt(var) * CTX_BRIDGE_SCALE).view(B, 1, 1, 1, 1)
+        out = ctx + torch.randn_like(ctx) * std
+        if CTX_BRIDGE_LAST_ONLY and ctx.shape[1] > 1:
+            # only the most-recent context slot holds the model's own output at inference
+            out = torch.stack([ctx[:, k] if k < ctx.shape[1] - 1 else out[:, k]
+                                   for k in range(ctx.shape[1])], dim=1)
+        return out
 
     if TECHNIQUE == "pixnoise":
         s = torch.sigmoid(1.4 + 2.0 * torch.randn(B, 1, 1, 1, 1, device=ctx.device)).clamp(1e-3, 1 - 1e-3) * SIGMA
