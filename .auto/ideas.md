@@ -576,6 +576,20 @@ where the base model FAILS. Cross-seed @6000/500 dt=0.024:
   catastrophic failure on hard seeds. Same class/mechanism as flat-gaussian ctx_bridge
   (validated SEED=2 cure earlier this week).
 
+### 3-SEED GENERALIZATION (honest, 4500/220 dt=0.024) - NOT a free lunch on easy seeds
+| config            | S0 ED | S2 ED  | S3 ED | 3-seed avg |
+|-------------------|-------|--------|-------|------------|
+| none              | 951   | 1242   | 988   | 1060       |
+| randsigma SCALE=.1| 875   | 947    | 1099  | 974 (-8%)  |
+Seed landscape: S0 easy (951), S2 hard-FAILS (1242, sharp 0.78), S3 easy (988). ~1/3 of
+inits catastrophically fail (blur+mass-drift). KEY HONESTY: on EASY seeds randsigma is
+neutral-to-HARMFUL — S0 marginal help (875, within 17% noise), S3 OVERSHOOTS (sharp 1.16,
+mass 0.0815, ED 1099>988). So randsigma's ONLY ROBUST effect is CURING catastrophic hard-
+seed failure; on easy seeds it can overshoot. 3-seed avg still -8% (the S2 catastrophe
+prevention dominates). VERDICT: robustness INSURANCE (cheap catastrophe prevention), not a
+free quality win. For production (one init, can't seed-tune): worth it if catastrophic AR
+failure is costlier than slight easy-case overshoot. The S2 cure is the load-bearing result.
+
 ### COMPUTE / DATA SCALING (user's 'train longer + bigger dataset' directive)
 Sweet spot at none@6000 steps/500 traj (~15 epochs) = ED 634 (S0) / 862 (S2). NON-monotonic:
 | config          | epochs | ED (S0) | note                       |
