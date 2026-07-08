@@ -633,13 +633,17 @@ HURT (overshoot). Do NOT treat it as a default quality booster. Validate on YOUR
 Root cause of the value: the noise forces robustness to degraded context, which
 prevents mean-regression collapse - but a model that isn't collapsing doesn't need it.
 
-### MOST PROMISING NEXT DIRECTION (root-cause, not band-aid)
+### MOST PROMISING NEXT DIRECTION (root-cause, not band-aid) - PROBED & FALSIFIED for loss/LR
 Instead of INSURING against the catastrophic seed-failure, FIX the training so no seed
-fails. The C=1 S2 collapse (blur+mass-drift = mean regression) is a training instability
-affecting ~1/3 of inits. Candidates: BRIDGE_WCLAMP tuning (the prior stability lever -
-maybe a different value prevents the S2 collapse without context noise), LR schedule,
-init scheme. A training recipe that makes ALL seeds stable would beat the insurance
-approach (no overshoot cost on good seeds). UNTESTED - high value if it works.
+fails. The C=1 S2 collapse (blur+mass-drift = mean regression) affects ~1/3 of inits.
+PROBED two stability levers (both FAILED): BRIDGE_WCLAMP=6 -> sharp 0.66/mass 0.263
+(WORSE); LR=5e-5 -> sharp 0.67/mass 0.323 (undertrain + WORSE). CONCLUSION: the collapse
+is a BASIN-OF-ATTRACTION issue that loss/optimizer tuning CANNOT fix. Training-time
+CONTEXT DEGRADATION (randsigma noise or prior self-feed) is the NECESSARY & effective
+cure. This VALIDATES the context-degradation approach as load-bearing for collapsing
+inits, not a disposable band-aid. Remaining root-cause idea (untested, lower prior):
+an init scheme or velocity/noise-prediction parameterization (vs x-pred) that avoids
+the mean-regression basin from the start. But context degradation already solves it cheaply.
 
 ### CHAMPION / run.env
 - Best primary metric (C=1 SEED=0): none@6000/500 = ED 634, sharp 1.00, mass 0.0075
