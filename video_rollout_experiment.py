@@ -143,6 +143,7 @@ CTX_BRIDGE_SIGMA_MIN = _env("CTX_BRIDGE_SIGMA_MIN", BRIDGE_SIGMA_MIN, float)  # 
 CTX_BRIDGE_SCALE     = _env("CTX_BRIDGE_SCALE", 1.0, float)   # overall multiplier on the context bridge noise std (sweep magnitude)
 CTX_BRIDGE_TIME      = os.environ.get("CTX_BRIDGE_TIME", "sample")  # "sample" (s~U(0,1), full bridge variance range) | "peak" (fixed s=0.5, max variance) | "uniform" (plain gaussian std=CTX_BRIDGE_SIGMA*SCALE, isolates the schedule effect)
 CTX_BRIDGE_LAST_ONLY = _env("CTX_BRIDGE_LAST_ONLY", 1, int)  # 1=corrupt only the most-recent context frame (the slot holding the model's own output at inference); 0=all frames
+CTX_BRIDGE_ANNEAL   = _env("CTX_BRIDGE_ANNEAL", 0.0, float)  # >0: linearly decay the context noise magnitude to 0 over this fraction of training (e.g. 0.8 -> noise off by 80% of TRAIN_STEPS, clean refinement after). Rationale: ctx_bridge is an accelerator the model outgrows; annealing captures early-regularization benefit while avoiding the late tax. 0=off (static)
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -631,20 +632,22 @@ def augment_context(ctx, model=None, extra=None, training=True):
         # Noise std follows the SAME variance schedule as the target flow path:
         #   c_s^2 = CTX_BRIDGE_SIGMA^2 * s(1-s) + CTX_BRIDGE_SIGMA_MIN^2
         # so the model sees context degraded by the bridge's own noise shape.
+        # Optional annealing: linearly decay the noise magnitude to 0 over a fraction
+        # of training (accelerator->clean refinement; the model outgrows static noise).
+        decay = 1.0
+        if CTX_BRIDGE_ANNEAL > 0 and TRAIN_STEPS > 0:
+            decay = max(0.0, 1.0 - _STEP / (CTX_BRIDGE_ANNEAL * TRAIN_STEPS))
         if CTX_BRIDGE_TIME == "peak":
             s = torch.full((B,), 0.5, device=ctx.device)
+            var = CTX_BRIDGE_SIGMA ** 2 * s * (1.0 - s) + CTX_BRIDGE_SIGMA_MIN ** 2
+            std = (torch.sqrt(var) * CTX_BRIDGE_SCALE * decay).view(B, 1, 1, 1, 1)
         elif CTX_BRIDGE_TIME == "uniform":
             # ablation: plain gaussian (no bridge schedule), isolates the schedule effect
-            std = CTX_BRIDGE_SIGMA * CTX_BRIDGE_SCALE
-            out = ctx + torch.randn_like(ctx) * std
-            if CTX_BRIDGE_LAST_ONLY and ctx.shape[1] > 1:
-                out = torch.stack([ctx[:, k] if k < ctx.shape[1] - 1 else out[:, k]
-                                       for k in range(ctx.shape[1])], dim=1)
-            return out
+            std = CTX_BRIDGE_SIGMA * CTX_BRIDGE_SCALE * decay
         else:  # "sample" — full bridge variance range per sample
             s = torch.rand(B, device=ctx.device)
-        var = CTX_BRIDGE_SIGMA ** 2 * s * (1.0 - s) + CTX_BRIDGE_SIGMA_MIN ** 2
-        std = (torch.sqrt(var) * CTX_BRIDGE_SCALE).view(B, 1, 1, 1, 1)
+            var = CTX_BRIDGE_SIGMA ** 2 * s * (1.0 - s) + CTX_BRIDGE_SIGMA_MIN ** 2
+            std = (torch.sqrt(var) * CTX_BRIDGE_SCALE * decay).view(B, 1, 1, 1, 1)
         out = ctx + torch.randn_like(ctx) * std
         if CTX_BRIDGE_LAST_ONLY and ctx.shape[1] > 1:
             # only the most-recent context slot holds the model's own output at inference
