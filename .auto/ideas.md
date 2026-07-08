@@ -604,28 +604,44 @@ past ~6000 OVERTRAINS the ViT on bridge+vloss (low train_loss but worse AR rollo
 the 1/(1-t c'/c)^2 weighting accumulates instability. (3) 6000/500 is the practical optimum:
 enough epochs to learn, not so many steps it overfits/destabilizes.
 
-### PRODUCTION RECOMMENDATIONS (this session)
-- RANDOM pixel noise on context (sigma~U(0,~0.1), mean std ~0.05) is a valid ROBUSTNESS aug
-  for AR forecasters prone to blur/mass-drift. It is regime-dependent: use it when the model
-  is drift-prone (hard data, unlucky init, limited compute); SKIP it when the model is already
-  stable (it's then a pure tax). For a production model you can't seed-tune, it is cheap
-  insurance against catastrophic AR failure.
-- Do NOT expect it to compound like scheduled sampling — like all static context corruption
-  tested here, the base model outgrows it at high compute on easy regimes. Its value is
-  failure-mode prevention, not ED improvement on already-good models.
-- Compute/data: scale them TOGETHER (keep ~15 epochs). Bigger data alone at fixed steps
-  undertrains; more steps alone past ~6000 overtrains this ViT+bridge+vloss combo.
+### MULTICHANNEL (C=2) TRANSFER - SEED-DEPENDENT, NOT robust (2026-07-08)
+Tested randsigma on production-like multichannel. C=2 @4500/220 dt=0.024:
+| config   | S0 ED (blurry base) | S2 ED (sharp base) | avg ED |
+|----------|---------------------|--------------------|--------|
+| none     | 2033 (sharp 0.97)   | 1795 (sharp 0.997) | 1914   |
+| randsigma| 1899 (sharp 1.03)   | 2170 (sharp 1.02)  | 2035 (+6%) |
+- S0 (slightly-blurry base): randsigma HELPS (-7% ED, sharpens 0.97->1.03, mass 10x).
+- S2 (already-sharp base): randsigma HURTS (+21% ED, overshoots).
+- Cross-seed avg: randsigma WORSE (+6%). The S0 'win' was a single-seed artifact
+  (the model happened to be slightly blurry). Prior session's flat-gaussian C=2 'soft
+  positive' was also single-seed (S0) - same artifact.
+- NOTE: at C=2 the HARD seed flips (S2 is sharp here, S0 is the blurry one) - seed-
+  difficulty is CONFIG-DEPENDENT, not intrinsic to a seed number.
+
+### FINAL HONEST VERDICT (20 experiments, C=1 + C=2, 3 seeds)
+Random non-conditional pixel noise on context (sigma~U(0,0.1)) is **CATASTROPHE
+INSURANCE ONLY**. The CONSISTENT pattern across EVERY config tested:
+  - Helps ONLY where the base model is already drifted/blurry (C=1 S2 catastrophic
+    blur+mass-drift; C=2 S0 mild blur).
+  - HURTS (overshoots) where the base model is already sharp (C=1 S0/S3; C=2 S2).
+Its SOLE robust value: preventing the ~1/3 of random inits that collapse into
+blur+mass-drift failure. It is NOT a reliable ED/quality improver cross-seed
+(C=1 3-seed avg -8% only because the S2 catastrophe dominates; C=2 2-seed +6% worse).
+PRODUCTION RECOMMENDATION: add context pixel noise ONLY if you observe catastrophic
+AR failure (blur+mass-drift) in your model. On a well-trained/stable model it can
+HURT (overshoot). Do NOT treat it as a default quality booster. Validate on YOUR data.
+Root cause of the value: the noise forces robustness to degraded context, which
+prevents mean-regression collapse - but a model that isn't collapsing doesn't need it.
+
+### MOST PROMISING NEXT DIRECTION (root-cause, not band-aid)
+Instead of INSURING against the catastrophic seed-failure, FIX the training so no seed
+fails. The C=1 S2 collapse (blur+mass-drift = mean regression) is a training instability
+affecting ~1/3 of inits. Candidates: BRIDGE_WCLAMP tuning (the prior stability lever -
+maybe a different value prevents the S2 collapse without context noise), LR schedule,
+init scheme. A training recipe that makes ALL seeds stable would beat the insurance
+approach (no overshoot cost on good seeds). UNTESTED - high value if it works.
 
 ### CHAMPION / run.env
-- Best single metric: none@6000/500 SEED=0 = ED 634 (but SEED-LUCKY; SEED=2 base fails at 862).
-- Technique (randsigma SCALE=0.1) is the robustness recommendation; not the ED champion on
-  lucky seeds. run.env currently holds the SEED=0 none champion (best metric).
-
-### REMAINING (low priority)
-- ~~randsigma@4500/220 SEED=2~~: ANSWERED. Cure IS compute-robust. none@4500/220 SEED=2
-  FAILS (ED 1242, sharp 0.78, mass 0.125); randsigma CURES (947, sharp 1.00, mass 0.003).
-  Completes 2x2 at moderate compute: randsigma wins BOTH seeds (S0 875<951, S2 947<1242;
-  avg 911 vs 1097, -17%). The SEED=2 failure is robust across compute (4500/220: none 1242;
-  6000/500: none 862) and NOT compute-fixable alone; randsigma cures it at both levels.
-- A smaller SCALE (0.03-0.05) at HIGH compute (6000/500) might reduce the SEED=0 tax while
-  keeping partial SEED=2 cure -> could win the @6000/500 cross-seed tie. Low prior.
+- Best primary metric (C=1 SEED=0): none@6000/500 = ED 634, sharp 1.00, mass 0.0075
+  (the compute/data sweet spot). run.env restored to this.
+- Technique (randsigma) is documented as catastrophe insurance, not the ED champion.
