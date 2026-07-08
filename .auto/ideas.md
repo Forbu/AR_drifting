@@ -474,3 +474,12 @@ scheduled sample mode (scale=0.5) is comparable and matches target's noise shape
 - Magnitude finer-tune is seed-noise now (overfitting frontier reached for this knob).
 - ctx_bridge + more context (K_CTX=3/4): untested; more context may change drift profile.
 - Flat gaussian at dt=0.012 with a TINY magnitude (<0.03): marginal, likely neutral.
+
+### MULTICHANNEL GENERALIZATION (C=2) — soft positive (2026-07-08)
+ctx_bridge flat gaussian on C_CHAN=2 @dt=0.024: ED neutral (2054~2033, within noise)
+BUT quality metrics improve: ed_late -12% (1803<2040), sharp 0.97->1.02, mass 0.040->0.021
+(2x better). Consistent with trust-sharp+mass methodology -> benefit transfers to
+multichannel (production-relevant: user's model is 4ctx->3fut multichannel). ED neutral
+here likely because C=2's failure mode is under-fit/blur (different from C=1 overshoot);
+ctx_bridge sharpens without moving the position-dominated ED much. Did NOT tune magnitude
+for C=2 (overfitting frontier) — production should re-tune magnitude per channel-set.
