@@ -556,31 +556,40 @@ class VideoRFJiT3D(nn.Module):
         vol_t = torch.cat([z_ctx, z_t.unsqueeze(1)], dim=1)        # (B, K+1, C, H, W)
         return vol_t.permute(0, 2, 1, 3, 4).contiguous()           # (B, C, K+1, H, W)
 
-    def _cond(self, t_fut, t_ctx, B):
-        # build the (B, context_dim) conditioning vector. If context_dim==2 the
-        # FIRST slot is the context time, the LAST is the future time (JiT3D uses
-        # t[:,-1] as the RF/bridge time and t[:,:-1] as extra context).
-        if self.context_dim == 2:
-            return torch.stack([t_ctx.view(B).float(), t_fut.view(B).float()], dim=1)
-        return t_fut.view(B, 1).float()
+    def _build_cond(self, t_fut, t_ctx_frames, B):
+        # build the (B, context_dim) conditioning vector for JiT3D (which uses t[:,-1]
+        # as the RF/bridge time and t[:,:-1] as extra context dims).
+        #   context_dim==1   : [t_fut]                                    (no context time)
+        #   context_dim==2   : [t_ctx_newest, t_fut]                      (last-only decouple)
+        #   context_dim==K+1 : [t_ctx[0],...,t_ctx[K-1], t_fut]           (graded decouple)
+        # t_ctx_frames: (B,K) or None (None -> all-ones = clean context, for inference).
+        cd = self.context_dim
+        if cd == 1:
+            return t_fut.view(B, 1).float()
+        if t_ctx_frames is None:
+            t_ctx_frames = torch.ones(B, self.k_ctx, device=t_fut.device, dtype=torch.float32)
+        if cd == 2:
+            return torch.stack([t_ctx_frames[:, -1].float(), t_fut.view(B).float()], dim=1)
+        # cd == K+1 (graded decouple): all per-frame context times + future
+        return torch.cat([t_ctx_frames.float(), t_fut.view(B, 1).float()], dim=1)
 
     def forward(self, z_t, ctx, t):
         # z_t: (B,C,H,W); ctx: (B,K,C,H,W); t: (B,). Inference / single-time path:
-        # context is assumed CLEAN -> context time = 1 (fully denoised) when decoupled.
+        # context is assumed CLEAN -> all context times = 1 (fully denoised) when decoupled.
         B = z_t.shape[0]
         vol = self._stack_volume(ctx, z_t)
-        s = torch.ones(B, device=z_t.device, dtype=torch.float32)  # clean context
-        t_in = self._cond(t, s, B)
+        t_in = self._build_cond(t, None, B)             # clean context -> per-frame times = 1
         out = self.jit(vol, t_in)                        # (B, C, K+1, H, W)
         x_pred = out[:, :, self.k_ctx:, :, :]           # keep target slice
         return x_pred.flatten(1, 2)                     # (B, C, H, W)
 
-    def forward_joint(self, z_ctx, z_t, t_fut, t_ctx):
-        # TRAIN-time joint path: noised context (RF @ t_ctx) + noised future (bridge @ t_fut).
+    def forward_joint(self, z_ctx, z_t, t_fut, t_ctx_frames):
+        # TRAIN-time joint path: noised context + noised future. t_ctx_frames: (B,K)
+        # per-frame context times (passed to the net only if context_dim>1).
         # Returns (ctx_pred (B,K,C,H,W), fut_pred (B,C,H,W)) — clean-frame predictions.
         B = z_t.shape[0]
         vol = self._stack_volume(z_ctx, z_t)
-        t_in = self._cond(t_fut, t_ctx, B)
+        t_in = self._build_cond(t_fut, t_ctx_frames, B)
         out = self.jit(vol, t_in)                        # (B, C, K+1, H, W)
         ctx_pred = out[:, :, :self.k_ctx, :, :]         # (B, C, K, H, W)
         fut_pred = out[:, :, self.k_ctx:, :, :].flatten(1, 2)  # (B, C, H, W)
@@ -1001,9 +1010,12 @@ def train(data):
         model = VideoRF3D(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS,
                           latent_blur_sigma=LATENT_BLUR).to(DEVICE)
     elif ARCH == "jit3d":
-        # JOINT_DECOPLE -> the net sees BOTH a context-time and a future-time
-        # (context_dim=2); otherwise the RF/bridge time only (context_dim=1).
-        _cdim = 2 if (JOINT_GEN and JOINT_DECOUPLE) else 1
+        # context_dim: 1 (no context time) | 2 (last-only decouple: newest-slot time
+        # + future) | K+1 (graded decouple: all per-frame times + future).
+        if JOINT_GEN and JOINT_DECOUPLE:
+            _cdim = (K_CTX + 1) if JOINT_GRADED else 2
+        else:
+            _cdim = 1
         model = VideoRFJiT3D(
             K_CTX, C_CHAN, IMG,
             embed_dim=JIT_EMBED_DIM, depth=JIT_DEPTH, num_heads=JIT_HEADS,
@@ -1077,7 +1089,7 @@ def train(data):
                 if _k not in noised:
                     z_ctx[:, _k] = ctx[:, _k]
             with _amp():
-                ctx_pred, fut_pred = model.forward_joint(z_ctx, z_t, t, s_ctx[:, -1])
+                ctx_pred, fut_pred = model.forward_joint(z_ctx, z_t, t, s_ctx)
                 loss_fut, _ = _bridge_future_loss(fut_pred, tgt, t)
                 loss_ctx = _rf_context_loss(ctx_pred[:, noised], ctx[:, noised], s_ctx[:, noised])
                 loss = loss_fut + JOINT_CTX_WEIGHT * loss_ctx
