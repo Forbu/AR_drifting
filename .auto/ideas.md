@@ -517,3 +517,22 @@ not a technique. At MATCHED compute, ctx_bridge only wins at moderate budget (<=
 - If you can train LONGER, the benefit fades — the base model learns robustness on its own.
   Don't expect it to compound like scheduled sampling; it's a bootstrap regularizer.
 - The magnitude (~0.06) and last-frame-only are load-bearing; K=2 is where it helps.
+
+### ANNEAL — DEAD (static is correct) (2027-07-08)
+Implemented CTX_BRIDGE_ANNEAL (linear decay of ctx noise to 0 over training).
+- anneal@6000 (0.8): ED 678 < static 755 (recovers late-tax penalty), best ed_late 623,
+  but does NOT beat none@6000 (646, within 5% noise). At high budget none is optimal.
+- anneal@4500 (0.8): ED 894 > static 792, sharp 0.91, mass 0.056 (WORSE on everything).
+  At moderate budget the model still NEEDS the regularizer; annealing it off -> revert
+  to blur/mass-drift (the exact failure modes ctx_bridge prevents). SAME failure as
+  MANIFOLD_ANNEAL ("model needs CONSISTENT regularizer").
+CONCLUSION: ctx_bridge must be STATIC. The model either needs it (moderate budget: keep
+ON) or has outgrown it (high budget: none wins anyway). Annealing combines the worst of
+both (removes regularizer while still needed). CTX_BRIDGE_ANNEAL=0 (off) is the default;
+feature kept in code as a documented negative result.
+
+### FULL ctx_bridge CHARACTERIZATION (technique space exhausted)
+Magnitude (0.06 optimal, U-shape), schedule (flat≈bridge, within noise), K (K=2 optimal,
+hurts K=3), frames (last-only optimal), compounding (accelerator not compounder, reverses
+>6000), anneal (dead), regime (helps dt=0.024, neutral dt=0.012), multichannel (soft
+positive). CHAMPION: static flat gaussian std~0.06, last-frame-only, K=2, @4500 drift regime.
