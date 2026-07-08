@@ -174,6 +174,13 @@ JOINT_LEAD      = _env("JOINT_LEAD", 0.3, float)          # COUPLE=1: how far AH
 JOINT_CTX_TMIN  = _env("JOINT_CTX_TMIN", 0.0, float)      # COUPLE=0: context RF time s ~ U(JOINT_CTX_TMIN, 1). Higher -> less context noise (closer to data)
 JOINT_DECOUPLE  = _env("JOINT_DECOUPLE", 1, int)          # 1: pass BOTH [s, t] to the net (context_dim=2); 0: pass only t (context noise level hidden from the net)
 JOINT_LAST_ONLY = _env("JOINT_LAST_ONLY", 0, int)         # 1: RF-noise only the most-recent context slot (holds model's own output at inference); 0=all K slots
+# Context interpolant: "rf" (linear rectified flow, generate-from-scratch) | "bridge"
+# (Brownian bridge, same clean-endpoint-landing family as the future). Bridge context
+# adds mid-path Brownian noise c_s eta AND uses the one-sided vloss weight that forces
+# sharp data-end reconstruction (the RF variant mean-pulls at high noise -> blur).
+JOINT_CTX_FLOW        = os.environ.get("JOINT_CTX_FLOW", "rf")        # "rf" | "bridge" : context-slot interpolant
+JOINT_CTX_BRIDGE_SIGMA= _env("JOINT_CTX_BRIDGE_SIGMA", 0.3, float)   # bridge-context: mid-path Brownian scale (var at s=0.5 = sigma^2/4)
+JOINT_CTX_BRIDGE_SIGMA_MIN = _env("JOINT_CTX_BRIDGE_SIGMA_MIN", 1e-3, float) # bridge-context: residual endpoint variance
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -957,11 +964,18 @@ def _bridge_future_loss(fut_pred, tgt, t):
 
 
 def _rf_context_loss(ctx_pred, ctx_clean, s):
-    """Linear-rectified-flow velocity loss on the CONTEXT slots (endpoint
-    reparameterization): the net predicts clean ctx from z_ctx=(1-s)eps+s*ctx.
-    ctx_pred/ctx_clean: (B,K,C,H,W); s: (B,). Returns loss_scalar."""
-    w = (1.0 / (1.0 - s).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)   # (B,)
-    loss = ((ctx_pred - ctx_clean) ** 2).mean(dim=(1, 2, 3, 4)) * w    # (B,)
+    """Context-slot reconstruction loss for the joint objective.
+    ctx_pred/ctx_clean: (B,K,C,H,W); s: (B,). Returns loss_scalar.
+    JOINT_CTX_FLOW="rf":     linear RF velocity weight 1/(1-s)^2 clamped (endpoint reparam).
+    JOINT_CTX_FLOW="bridge": Brownian-bridge vloss weight (1-s c'/c)^2 clamped
+                             (one-sided data-end upweight -> forces SHARP recon, avoids
+                             the mean-pull blur of the RF variant at high noise)."""
+    if JOINT_CTX_FLOW == "bridge":
+        c_s, cp_over_c = bridge_coeffs(s, JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
+        w = ((1.0 - s * cp_over_c) ** 2).clamp(max=BRIDGE_WCLAMP)          # (B,)
+    else:  # "rf"
+        w = (1.0 / (1.0 - s).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)    # (B,)
+    loss = ((ctx_pred - ctx_clean) ** 2).mean(dim=(1, 2, 3, 4)) * w         # (B,)
     return loss.mean().float()
 
 
@@ -1023,8 +1037,14 @@ def train(data):
                 s = (t + JOINT_LEAD).clamp(max=1.0)          # context leads toward data by JOINT_LEAD
             else:
                 s = torch.rand(BATCH, device=DEVICE) * (1.0 - JOINT_CTX_TMIN) + JOINT_CTX_TMIN  # U(TMIN,1)
-            eps_ctx = torch.randn_like(ctx)                 # (B,K,C,H,W) per-slot RF noise source
-            z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx   # RF noised context
+            eps_ctx = torch.randn_like(ctx)                 # (B,K,C,H,W) per-slot source
+            if JOINT_CTX_FLOW == "bridge":
+                # bridge context: z_ctx = (1-s)eps + s*ctx + c_s eta  (clean-endpoint landing)
+                c_s, _ = bridge_coeffs(s, JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
+                z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx \
+                        + c_s.view(BATCH, 1, 1, 1, 1) * torch.randn_like(ctx)
+            else:  # "rf"
+                z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx   # RF noised context
             if JOINT_LAST_ONLY and ctx.shape[1] > 1:
                 # only RF-noise the most-recent slot (holds the model's own output at inference)
                 keep = [k for k in range(ctx.shape[1] - 1)]
@@ -1275,7 +1295,7 @@ def main():
           f"JOINT_GEN={JOINT_GEN} JOINT_CTX_W={JOINT_CTX_WEIGHT} "
           f"JOINT_COUPLE={JOINT_COUPLE} JOINT_LEAD={JOINT_LEAD} "
           f"JOINT_TMIN={JOINT_CTX_TMIN} JOINT_DECOUPLE={JOINT_DECOUPLE} "
-          f"JOINT_LAST_ONLY={JOINT_LAST_ONLY}", flush=True)
+          f"JOINT_LAST_ONLY={JOINT_LAST_ONLY} JOINT_CTX_FLOW={JOINT_CTX_FLOW}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,
