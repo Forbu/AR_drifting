@@ -181,6 +181,15 @@ JOINT_LAST_ONLY = _env("JOINT_LAST_ONLY", 0, int)         # 1: RF-noise only the
 JOINT_CTX_FLOW        = os.environ.get("JOINT_CTX_FLOW", "rf")        # "rf" | "bridge" : context-slot interpolant
 JOINT_CTX_BRIDGE_SIGMA= _env("JOINT_CTX_BRIDGE_SIGMA", 0.3, float)   # bridge-context: mid-path Brownian scale (var at s=0.5 = sigma^2/4)
 JOINT_CTX_BRIDGE_SIGMA_MIN = _env("JOINT_CTX_BRIDGE_SIGMA_MIN", 1e-3, float) # bridge-context: residual endpoint variance
+# GRADED per-frame context times (user idea): bridge-noise ALL context frames, each at
+# a DIFFERENT time, graded so t_ctx[oldest] > t_ctx[newest] > t_future (high t = less
+# noise). This simulates DEGRADING information: the newest context frame (most drifted
+# at inference) gets the most noise, the oldest (dynamics anchor) stays cleanest, the
+# future is noisiest. Overrides JOINT_LAST_ONLY (all frames noised). With JOINT_DECOUPLE=0
+# the per-frame times are NOT passed to the net (model sees only the future time t and
+# must handle the graded per-frame noise itself).
+JOINT_GRADED     = _env("JOINT_GRADED", 0, int)          # 1=graded per-frame context times (all frames, newest noisiest->oldest cleanest); overrides LAST_ONLY
+JOINT_LEAD_STEP  = _env("JOINT_LEAD_STEP", 0.3, float)    # GRADED: extra lead per OLDER frame (older=cleaner); newest gets JOINT_LEAD, oldest gets JOINT_LEAD+STEP*(K-1)
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -965,17 +974,21 @@ def _bridge_future_loss(fut_pred, tgt, t):
 
 def _rf_context_loss(ctx_pred, ctx_clean, s):
     """Context-slot reconstruction loss for the joint objective.
-    ctx_pred/ctx_clean: (B,K,C,H,W); s: (B,). Returns loss_scalar.
+    ctx_pred/ctx_clean: (B,K,C,H,W); s: (B,) or (B,K) (per-frame graded). Returns scalar.
     JOINT_CTX_FLOW="rf":     linear RF velocity weight 1/(1-s)^2 clamped (endpoint reparam).
     JOINT_CTX_FLOW="bridge": Brownian-bridge vloss weight (1-s c'/c)^2 clamped
                              (one-sided data-end upweight -> forces SHARP recon, avoids
                              the mean-pull blur of the RF variant at high noise)."""
+    B, K = ctx_pred.shape[0], ctx_pred.shape[1]
+    if s.dim() == 1:
+        s = s.view(B, 1).expand(B, K)                       # (B,K)
     if JOINT_CTX_FLOW == "bridge":
-        c_s, cp_over_c = bridge_coeffs(s, JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
-        w = ((1.0 - s * cp_over_c) ** 2).clamp(max=BRIDGE_WCLAMP)          # (B,)
+        c_s, cp_over_c = bridge_coeffs(s.reshape(-1), JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
+        c_s = c_s.view(B, K); cp_over_c = cp_over_c.view(B, K)
+        w = ((1.0 - s * cp_over_c) ** 2).clamp(max=BRIDGE_WCLAMP)   # (B,K)
     else:  # "rf"
-        w = (1.0 / (1.0 - s).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)    # (B,)
-    loss = ((ctx_pred - ctx_clean) ** 2).mean(dim=(1, 2, 3, 4)) * w         # (B,)
+        w = (1.0 / (1.0 - s).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)   # (B,K)
+    loss = ((ctx_pred - ctx_clean) ** 2).mean(dim=(2, 3, 4)) * w       # (B,K)
     return loss.mean().float()
 
 
@@ -1032,27 +1045,41 @@ def train(data):
         # predict"). Inference rollout is unchanged (predict from clean context).
         # ------------------------------------------------------------------ #
         if JOINT_GEN and ARCH == "jit3d":
-            # context RF time s: "closer to data" than the future time t.
-            if JOINT_COUPLE:
-                s = (t + JOINT_LEAD).clamp(max=1.0)          # context leads toward data by JOINT_LEAD
+            K = ctx.shape[1]
+            eps_ctx = torch.randn_like(ctx)                       # (B,K,C,H,W) per-slot source
+            if JOINT_GRADED:
+                # per-frame graded context times: newest (k=K-1) noisiest, oldest (k=0)
+                # cleanest. t_ctx[k] = min(1, t + JOINT_LEAD + JOINT_LEAD_STEP*(K-1-k)).
+                # Simulates degrading info: the recent slot (most drifted at inference)
+                # gets the most noise, the oldest dynamics slot stays cleanest.
+                leads = torch.tensor([JOINT_LEAD + JOINT_LEAD_STEP * (K - 1 - k)
+                                      for k in range(K)], device=DEVICE)        # (K,) increasing toward older
+                s_ctx = (t.view(-1, 1) + leads.view(1, K)).clamp(max=1.0)      # (B,K)
+                noised = list(range(K))                                       # all frames noised
             else:
-                s = torch.rand(BATCH, device=DEVICE) * (1.0 - JOINT_CTX_TMIN) + JOINT_CTX_TMIN  # U(TMIN,1)
-            eps_ctx = torch.randn_like(ctx)                 # (B,K,C,H,W) per-slot source
+                if JOINT_COUPLE:
+                    s = (t + JOINT_LEAD).clamp(max=1.0)
+                else:
+                    s = torch.rand(BATCH, device=DEVICE) * (1.0 - JOINT_CTX_TMIN) + JOINT_CTX_TMIN
+                s_ctx = s.view(-1, 1).expand(-1, K).contiguous()              # (B,K) same time for all frames
+                noised = [K - 1] if (JOINT_LAST_ONLY and K > 1) else list(range(K))
+            sb = s_ctx                                                             # (B,K)
             if JOINT_CTX_FLOW == "bridge":
-                # bridge context: z_ctx = (1-s)eps + s*ctx + c_s eta  (clean-endpoint landing)
-                c_s, _ = bridge_coeffs(s, JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
-                z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx \
-                        + c_s.view(BATCH, 1, 1, 1, 1) * torch.randn_like(ctx)
+                # bridge context per frame: z_ctx[k]=(1-s_k)eps_k + s_k*ctx_k + c_{s_k} eta_k
+                c_s, _ = bridge_coeffs(sb.reshape(-1), JOINT_CTX_BRIDGE_SIGMA, JOINT_CTX_BRIDGE_SIGMA_MIN)
+                c_s = c_s.view(BATCH, K, 1, 1, 1)
+                z_ctx = (1.0 - sb).view(BATCH, K, 1, 1, 1) * eps_ctx \
+                        + sb.view(BATCH, K, 1, 1, 1) * ctx + c_s * torch.randn_like(ctx)
             else:  # "rf"
-                z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx   # RF noised context
-            if JOINT_LAST_ONLY and ctx.shape[1] > 1:
-                # only RF-noise the most-recent slot (holds the model's own output at inference)
-                keep = [k for k in range(ctx.shape[1] - 1)]
-                z_ctx = torch.cat([ctx[:, keep], z_ctx[:, -1:]], dim=1)
+                z_ctx = (1.0 - sb).view(BATCH, K, 1, 1, 1) * eps_ctx + sb.view(BATCH, K, 1, 1, 1) * ctx
+            # restore clean (non-noised) frames to their original value
+            for _k in range(K):
+                if _k not in noised:
+                    z_ctx[:, _k] = ctx[:, _k]
             with _amp():
-                ctx_pred, fut_pred = model.forward_joint(z_ctx, z_t, t, s)
+                ctx_pred, fut_pred = model.forward_joint(z_ctx, z_t, t, s_ctx[:, -1])
                 loss_fut, _ = _bridge_future_loss(fut_pred, tgt, t)
-                loss_ctx = _rf_context_loss(ctx_pred, ctx, s)
+                loss_ctx = _rf_context_loss(ctx_pred[:, noised], ctx[:, noised], s_ctx[:, noised])
                 loss = loss_fut + JOINT_CTX_WEIGHT * loss_ctx
             opt.zero_grad()
             loss.backward()
@@ -1295,7 +1322,8 @@ def main():
           f"JOINT_GEN={JOINT_GEN} JOINT_CTX_W={JOINT_CTX_WEIGHT} "
           f"JOINT_COUPLE={JOINT_COUPLE} JOINT_LEAD={JOINT_LEAD} "
           f"JOINT_TMIN={JOINT_CTX_TMIN} JOINT_DECOUPLE={JOINT_DECOUPLE} "
-          f"JOINT_LAST_ONLY={JOINT_LAST_ONLY} JOINT_CTX_FLOW={JOINT_CTX_FLOW}", flush=True)
+          f"JOINT_LAST_ONLY={JOINT_LAST_ONLY} JOINT_CTX_FLOW={JOINT_CTX_FLOW} "
+          f"JOINT_GRADED={JOINT_GRADED} JOINT_LEAD_STEP={JOINT_LEAD_STEP}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,

@@ -72,4 +72,27 @@ plus helpers `_bridge_future_loss()` and `_rf_context_loss()` and
 
 ## What's Been Tried
 (filled in as experiments accumulate)
-- BASELINE (JOINT_GEN=0, bridge+none): see log.jsonl entry 1.
+- BASELINE (JOINT_GEN=0, bridge+none): ED 951 (SEED=0), 1220 (SEED=1).
+- joint RF-context, all-slots: WORSE (ED 1141 @w1.0, 1417 @w0.1). Noising BOTH context
+  slots destroys the dynamics signal (bridge needs clean-ish context).
+- joint RF-context, LAST_ONLY (only the recent/drift-prone slot RF-noised, older dynamics
+  slot kept clean): WIN ED 766 (lead0.3) / 755 (lead0.5). Robustness comes from noising
+  exactly the slot that holds the model's own (drifted) output at inference.
+- lead & weight are NOISY/chaotic knobs on SEED=0 (lead 0.7 -> ED 1509; w0.5 -> 1725).
+  Do NOT fine-tune them — only the structural choice (last-only, lead~0.5, w~1.0) is robust.
+- **JOINT_CTX_FLOW=bridge (bridge for BOTH context + future)** — user request. With
+  context sigma=0.3: WORSE (ED 1195) — too much extra Brownian noise. With **sigma=0.1:
+  NEW BEST ED 642 (-32% vs 951)**, sharpness recovered 0.85->0.95. The bridge's
+  clean-endpoint landing + one-sided vloss forces sharp data-end recon (fixes blur).
+- **CROSS-SEED VALIDATED**: champion (bridge-ctx sigma=0.1, last-only, lead0.5, w1.0)
+  SEED=0: 951->642 (-32%); SEED=1: 1220->669 (-45%). GENERALIZES — real, not overfit.
+  Quality caveat: sharpness 0.95 (SEED=0) but 0.74 (SEED=1) — blur is seed-dependent.
+
+## Champion config (so far)
+```
+JOINT_GEN=1 JOINT_CTX_FLOW=bridge JOINT_CTX_BRIDGE_SIGMA=0.1 JOINT_CTX_BRIDGE_SIGMA_MIN=0.001
+JOINT_LAST_ONLY=1 JOINT_LEAD=0.5 JOINT_COUPLE=1 JOINT_DECOUPLE=1 JOINT_CTX_WEIGHT=1.0
+FLOW=bridge BRIDGE_LOSS=vloss BRIDGE_SIGMA=0.3 BRIDGE_WCLAMP=10
+ARCH=jit3d TRAIN_STEPS=4500 SEED=0 LORENZ_DT=0.024
+```
+ED 642 (SEED=0) / 669 (SEED=1). beat baseline 951/1220 by 32-45%.
