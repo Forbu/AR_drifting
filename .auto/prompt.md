@@ -1,114 +1,75 @@
-# Autoresearch: Rollout Stability for Rectified-Flow 3D Field Forecasting
+# Autoresearch: Joint RF-Context-Generation + Bridge-Future-Prediction for AR Rollout Stability
 
-## Objective
-Find training/inference techniques that keep an autoregressive (AR) rectified-flow
-forecaster **on-distribution over long rollouts** — frames that "look like training
-data" instead of going blurry / developing artifacts. This is the weather-model
-rollout-instability problem (see ../FINDINGS.md), reproduced here on a fast,
-structured 3D volumetric benchmark so we can iterate quickly.
+## Objective (user idea)
+Stabilize the autoregressive (AR) rollout of a Brownian-bridge flow-matching video
+forecaster by adding a **joint training objective**: the model simultaneously
+**(a) DENOISES the context frames via a LINEAR rectified-flow interpolant** (learns
+to *generate* valid data from scratch — a strong generative prior) and
+**(b) PREDICTS the future frame via the Brownian-bridge interpolant** (learns
+dynamics / prediction from other frames).
 
-The known result we want to reproduce-and-beat: on images/structured data,
-**Gaussian pixel/voxel noise on the context does NOT stabilize rollout well;
-Gaussian blur does.** The loop must beat the best stabilization we can find.
+Mechanism / hypothesis:
+- Input: `[noisy-context-frames..., noisy-future-frame]` -> output: clean frames for BOTH.
+- Context uses **linear RF**: `z_ctx = (1-s)·eps + s·ctx`.
+- Future uses **Brownian bridge**: `z_t = (1-t)·eps + t·tgt + c_t·eta`.
+- The context RF time `s` is sampled **closer to data than** the future time `t`
+  (`s ≥ t`), because at inference the context frames are the model's own
+  already-refined outputs (near-clean) — "generate the data first, then predict".
+- Total loss = `bridge_loss(future) + JOINT_CTX_WEIGHT · rf_loss(context)`.
+- At **INFERENCE** the rollout is UNCHANGED: predict the future from CLEAN context.
+  The context-generation head is a training-only auxiliary that (we hypothesize)
+  teaches an on-manifold prior + robustifies against AR context drift.
 
-## Workload / Data
-- 3D scalar density field (16x16x16) — a Gaussian "cloud" blob whose center
-  follows a Lorenz attractor (chaotic, low-dim manifold), amplitude/width slowly
-  modulated. Generated in `vol_rollout_experiment.py:VolumeSequenceData`.
-- K=2 context frames → forecast next frame. Rectified flow, endpoint/x-prediction,
-  inverse-conditional-variance weighted velocity loss (matches weather model).
-- Train ~2600 steps; AR rollout 24 trajectories × 50 steps for eval.
+The number to beat is the standard **Brownian-bridge forecaster with no joint head**
+(JOINT_GEN=0), measured under the same arch/data/seed.
 
 ## Metrics
-- **Primary**: `rollout_mmd` (unitless, **lower is better**) — squared MMD with
-  Gaussian kernel between feature distributions of AR-rollout frames and a
-  held-out training-frame reference. Features = avg-pool(6^3) + grad-energy +
-  Laplacian-energy + total-mass + max. Lower = rollout frames look like training.
-- Secondary: `sharpness_ratio` (1.0 ideal; <1=blurry, >1=artifacts),
-  `mass_drift` (relative total-mass error), `train_loss`, `mmd_floor` (noise
-  floor: fresh training sample vs reference — sanity, should be ~0 and stable),
-  `wall_s`.
+- **Primary**: `rollout_ed` (energy distance, **LOWER is better**) — distributional
+  distance between long-AR-rollout frames and a held-out training-frame reference
+  (energy distance on pooled/grad/Laplacian/mass/max features; non-saturating).
+- **Secondary**: `ed_late` (energy distance on the LATE half of the rollout, where
+  drift compounds — the key stability signal), `sharpness_ratio` (1.0 ideal; <1
+  blurry, >1 artifacts), `mass_drift` (relative total-mass error), `train_loss`,
+  `mmd` (saturating kernel MMD, sanity), `ed_floor` (noise floor), `wall_s`.
+- **Rollout_ed (early/overall) can HIDE instability** — always check ed_late +
+  sharpness + mass too (lesson from prior sessions: RF looked "tied" at early ED but
+  ed_late/sharpness showed it was already diverging).
 
 ## How to Run
-`.auto/measure.sh` — runs `vol_rollout_experiment.py`. Technique + hyperparams via
-env vars: `TECHNIQUE`, `SIGMA`, `BLUR_SIGMA`, `SELFFEED_PROB`, `SPECTRAL_W`,
-`DIFFFORCE_P`, plus sizing knobs (`TRAIN_STEPS`, `BATCH`, `ODE_STEPS`, etc.).
-Outputs `METRIC name=value` lines parsed automatically.
+`.auto/measure.sh` — sources `.auto/run.env` (rewritten each iteration) and runs
+`video_rollout_experiment.py`. All knobs are env vars. Outputs `METRIC name=value`.
 
-## The Lever (what to edit)
-**`augment_context()`** in `vol_rollout_experiment.py` — context augmentation at
-training time (and optionally inference). This is the AR-stability mechanism.
-**`extra_loss()`** — auxiliary regularizers (e.g. spectral/TV HF penalty).
-Add new techniques as new branches; switch via `TECHNIQUE` env var.
-
-Techniques implemented: none, pixnoise, blur, blur_noise, manifold_noise,
-selffeed (scheduled sampling), diff_forcing, spectral, inference_blur.
+## The Lever (what to edit / sweep)
+The joint objective is implemented in `train()` (`if JOINT_GEN and ARCH=="jit3d":`)
+plus helpers `_bridge_future_loss()` and `_rf_context_loss()` and
+`VideoRFJiT3D.forward_joint()`. Sweep the JOINT_* env knobs:
+- `JOINT_GEN` (1=on, 0=baseline-off), `JOINT_CTX_WEIGHT` (context loss weight),
+- `JOINT_COUPLE` (1: `s=min(1,t+JOINT_LEAD)`; 0: `s~U(JOINT_CTX_TMIN,1)`),
+- `JOINT_LEAD` (how far the context time leads toward data), `JOINT_CTX_TMIN`,
+- `JOINT_DECOUPLE` (1: pass BOTH [s,t] to the net, context_dim=2; 0: pass only t),
+- `JOINT_LAST_ONLY` (1: RF-noise only the most-recent context slot).
 
 ## Files in Scope
-- `vol_rollout_experiment.py` — the whole benchmark (data/model/train/eval). Edit freely.
+- `video_rollout_experiment.py` — the whole benchmark. Edit freely.
+- `.auto/run.env` — the per-iteration hyperparams (rewritten by the loop).
 - `.auto/measure.sh` — benchmark runner.
 
 ## Off Limits
-- Do NOT edit the other `*_experiment.py` / `*.md` files (prior experiments).
-- Do NOT weaken the metric to "cheat" (e.g. don't make the reference set include
-  rollout-like frames, don't train on holdout trajectories, don't reduce
-  ROLLOUT_LEN/N_ROLLOUT to make MMD trivially low). The point is real stability.
+- Do NOT edit other `*_experiment.py` / `*.md` files (prior experiments).
+- Do NOT cheat the metric: don't include rollout-like frames in the reference, don't
+  train on holdout trajectories, don't shrink ROLLOUT_LEN/N_ROLLOUT to trivialize ED.
+- The point is REAL rollout stability improvement.
 
 ## Constraints
-- Must run on one L4 GPU, < ~4 min per iteration.
-- Keep `train_loss` reasonable (model must actually learn dynamics).
-- `mmd_floor` should stay low & stable (~1e-3 or below) — if it jumps, the metric
-  is broken, fix before trusting improvements.
+- One GPU (L4). Keep iterations < ~4 min (TRAIN_STEPS=4500, jit3d-128/4/4, PHW8 ~ OK).
+- Determinism ON (`DETERMINISTIC=1` + `CUBLAS_WORKSPACE_CONFIG`); verify reproducibility
+  before trusting a surprising win (chaotic rollout × non-determinism = ±50% noise).
+- Bridge future MUST use `BRIDGE_LOSS=vloss` (`uniform` collapses to context-pred on
+  easy data; the `(1-t c'/c)^2` one-sided data-end upweight prevents collapse).
+- Use `LORENZ_DT=0.024` (moderate-fast regime where the bridge >> RF is established;
+  RF develops artifacts/mass-drift here — the regime we want to stabilize).
+- Keep sharpness ~1.0 and mass_drift ~0 (don't game ED via high-freq artifacts).
 
 ## What's Been Tried
-(update as experiments accumulate)
-
-Full results + mechanism in `FINDINGS_VIDEO.md`. Summary:
-
-| Technique | rollout_ed | sharp | mass_drift | verdict |
-|---|---|---|---|---|
-| pixnoise (baseline) | 9770 | 0.18 | 0.65 | FAILS — blurry |
-| blur σ=0.8 | 5214 | 1.65 | 0.28 | works but artifacts+precision loss |
-| manifold_noise | 1635 | 0.98 | 0.05 | best per-frame quality; cheap |
-| **selffeed** p=0.3+blur0.4 | **725** | 0.88 | 0.08 | best stability (7x blur, 13x pixnoise) |
-| selffeed no-blur | 1200 | 0.65 | 0.24 | blur is needed |
-| selffeed p=0.2 / p=0.5 | 1410/5869 | — | — | optimum at 0.3 |
-| selffeed2 (2-step) | 988 | 0.77 | 0.18 | deeper compounding doesn't help |
-| **selffeed_m** (champion) | **747** | **0.90** | **0.07** | stable + sharp |
-
-**Winner: scheduled sampling (selffeed_m) + multi-step rollout loss (selffeed_ms).**
-Generalizes to C=2 / different seed (selffeed_m: 3x pixnoise, sharpness 0.88).
-
-**DETERMINISTIC REGIME (2026-07-04):** switched to `torch.use_deterministic_algorithms`
-+ `CUBLAS_WORKSPACE_CONFIG` + `cudnn.deterministic`. Prior runs had ~±50% run-to-run
-variance from GPU non-determinism × chaotic-rollout amplification (a false "285" ED
-outlier appeared and did NOT reproduce). Now single runs reproduce exactly.
-
-Reproducible-regime numbers (lower=better):
-| Technique | rollout_ed@2000 | rollout_ed@3500 | sharp@3500 | note |
-|---|---|---|---|---|
-| pixnoise | 6746 | 2887 | 0.67 | fails |
-| selffeed_m | 912 | — | — | scheduled sampling + amplitude jitter |
-| **selffeed_ms (champion)** | **690** | **156** | 0.92 | + 2-step rollout loss (MS_PROB=0.3) |
-
-selffeed_ms is **9.8× better than pixnoise at 2000 steps and 18.5× at 3500**
-(the gap WIDENS with training — the win is the technique, not compute; both
-improve with budget but selffeed_ms far faster). TRAIN_STEPS=5000 is impractical
-(timeout). Standard iteration regime = 2000; max-quality = 3500 (ED 156).
-MS_PROB sweep: 0.15->725, 0.3->690 (optimum), 0.5->1023. MS_DEPTH: 2 optimal
-(3->870). BPTT (gradient through pred): worse, mode collapse -> DETACH.
-
-Key insight: rollout instability = exposure bias. Selffeed augments the INPUT
-context (feeds model's own predictions); the multi-step rollout loss adds a LOSS
-on the model's 2-step compounded output, directly closing the compounding gap.
-Both are needed. Pixel noise fails (breaks image structure).
-
-## Key Insight from Prior Work (FINDINGS.md)
-Stability comes from the model **seeing degraded conditions during training** so it
-doesn't extrapolate catastrophically on drifted AR inputs — NOT from informing it
-about the noise level (the "decoupled-uncond" ablation matched the informed version).
-So at inference we feed clean context (decoupled). The open question for structured
-data: WHAT KIND of degradation best emulates real AR drift? Pixel noise breaks local
-structure (bad); blur is smoother (better). Candidates: blur, blur+noise, manifold-
-aligned perturbation, scheduled sampling (feed model's own predictions), spectral
-regularizer, diffusion-forcing-style per-frame noise.
+(filled in as experiments accumulate)
+- BASELINE (JOINT_GEN=0, bridge+none): see log.jsonl entry 1.

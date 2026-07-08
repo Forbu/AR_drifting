@@ -1,7 +1,7 @@
 #!/bin/bash
 # Autoresearch benchmark: VIDEO rollout stability (JiT-3D + Brownian-bridge flow).
-# Primary metric: rollout_ed (energy distance, LOWER=better).
-# Hyperparams read from .auto/run.env (rewritten each iteration).
+# Emits METRIC name=value lines. Primary: rollout_ed (lower=better).
+# Hyperparams read from .auto/run.env (written each iteration).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1

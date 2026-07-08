@@ -153,6 +153,27 @@ CTX_BRIDGE_ANNEAL   = _env("CTX_BRIDGE_ANNEAL", 0.0, float)  # >0: linearly deca
 #   DRIFTED prediction, so the model must train on perturbed sources to not amplify drift).
 FLOW_SOURCE     = os.environ.get("FLOW_SOURCE", "noise")
 SRC_NOISE       = _env("SRC_NOISE", 0.0, float)   # lastctx: source perturbation std at TRAIN (eps=last+SRC_NOISE*randn) AND inference (per-sample diversity for SAMPLE_AVG). 0=pure deterministic (exposure-biased, unstable).
+# --- JOINT context-generation(RF) + future-prediction(bridge) objective ---
+# NEW (user idea): at TRAIN time the model jointly (a) DENOISES the context frames
+# via a LINEAR rectified-flow interpolant (z_ctx=(1-s)eps+s*ctx -> learns to
+# GENERATE valid data from scratch) and (b) PREDICTS the future frame via the
+# Brownian-bridge interpolant (z_t=(1-t)eps+t*tgt+c_t eta -> learns dynamics).
+# The model sees [noisy-ctx..., noisy-future] and outputs clean frames for BOTH.
+# Hypothesis: the RF context-reconstruction head teaches a strong generative prior
+# of on-manifold frames, and training on (lightly) RF-noised context robustifies
+# the forecaster against AR context drift -> more stable long rollouts. At INFERENCE
+# the rollout is UNCHANGED (predict future from clean context); the context-gen
+# head is a training-only auxiliary. The context RF time s is sampled CLOSER to
+# data than the future time t (s>=t, "generate the data first, then predict"),
+# because at inference the context frames are the model's own already-refined
+# outputs (near-clean). Decoupling optionally passes BOTH times to the net.
+JOINT_GEN       = _env("JOINT_GEN", 0, int)               # 1=enable joint RF-ctx + bridge-fut objective (jit3d only; sets context_dim=2 if decoupled)
+JOINT_CTX_WEIGHT= _env("JOINT_CTX_WEIGHT", 1.0, float)    # weight on the context RF reconstruction loss term (relative to the bridge future loss)
+JOINT_COUPLE    = _env("JOINT_COUPLE", 1, int)            # 1: context time s = min(1, t + JOINT_LEAD) (context leads toward data); 0: s ~ U(JOINT_CTX_TMIN, 1) independent
+JOINT_LEAD      = _env("JOINT_LEAD", 0.3, float)          # COUPLE=1: how far AHEAD of t the context time is (larger -> less context noise / closer to data)
+JOINT_CTX_TMIN  = _env("JOINT_CTX_TMIN", 0.0, float)      # COUPLE=0: context RF time s ~ U(JOINT_CTX_TMIN, 1). Higher -> less context noise (closer to data)
+JOINT_DECOUPLE  = _env("JOINT_DECOUPLE", 1, int)          # 1: pass BOTH [s, t] to the net (context_dim=2); 0: pass only t (context noise level hidden from the net)
+JOINT_LAST_ONLY = _env("JOINT_LAST_ONLY", 0, int)         # 1: RF-noise only the most-recent context slot (holds model's own output at inference); 0=all K slots
 # rollout eval
 N_ROLLOUT       = _env("N_ROLLOUT", 24, int)
 ROLLOUT_LEN     = _env("ROLLOUT_LEN", 50, int)
@@ -161,6 +182,7 @@ TECHNIQUE       = os.environ.get("TECHNIQUE", "pixnoise")
 SIGMA           = _env("SIGMA", 0.40, float)     # pixel-noise std
 BLUR_SIGMA      = _env("BLUR_SIGMA", 1.2, float) # 2D gaussian blur std
 SELFFEED_PROB   = _env("SELFFEED_PROB", 0.25, float)
+SELFFEED_ODE_STEPS = _env("SELFFEED_ODE_STEPS", 0, int)  # >0: cheap surrogate ODE steps for the self-generated prediction (emulates drift; only needs a ROUGH pred, e.g. 6-8 not the full ODE_STEPS=32 -> makes self-feed feasible on the ViT). 0=use full ODE_STEPS (accurate but ~13x slower).
 SELFFEED_GATE   = _env("SELFFEED_GATE", 0.0, float)   # >0: error-gate self-feed (relative quantile kept, e.g. 0.5=keep low-error half)
 SELFFEED_GATE_ABS = _env("SELFFEED_GATE_ABS", 0.0, float)  # >0: ABSOLUTE gate - keep if surrogate err < this * frame_variance (scale-invariant, regime-aware)
 SPECTRAL_W      = _env("SPECTRAL_W", 1e-2, float)
@@ -474,15 +496,20 @@ def _import_jit3d():
 class VideoRFJiT3D(nn.Module):
     """Adapter: rectified-flow endpoint predictor backed by the production
     JiT-3D ViT. Exposes forward(z_t, ctx, t) -> x_pred and get_velocity like the
-    conv backbones."""
+    conv backbones. Optionally supports context_dim=2 (JOINT_DECOUPLE) so the net
+    can be conditioned on BOTH a context time and a future time, plus forward_joint
+    which returns clean-frame predictions for the context slots AND the future slot
+    (used by the joint RF-ctx-generation + bridge-fut-prediction objective)."""
     def __init__(self, k_ctx, c_chan, img,
                  embed_dim=128, depth=4, num_heads=4,
                  patch_t=1, patch_hw=4, mlp_ratio=2.6,
-                 corrupt_prob=0.0, corrupt_embed=0.10, corrupt_block0=0.05):
+                 corrupt_prob=0.0, corrupt_embed=0.10, corrupt_block0=0.05,
+                 context_dim=1):
         super().__init__()
         JiT3D_Modern = _import_jit3d()
         self.k_ctx = k_ctx
         self.c_chan = c_chan
+        self.context_dim = context_dim
         T = k_ctx + 1  # K context frames + 1 noisy target frame
         assert img % patch_hw == 0, f"IMG={img} must be divisible by JIT_PATCH_HW={patch_hw}"
         assert T % patch_t == 0, f"T={T} must be divisible by JIT_PATCH_T={patch_t}"
@@ -495,7 +522,7 @@ class VideoRFJiT3D(nn.Module):
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
-            context_dim=1,          # only the RF time scalar is passed as conditioning
+            context_dim=context_dim,          # 1 (RF time only) | 2 (context-time + future-time for JOINT_DECOUPLE)
             time_emb_dim=64,
             n_context_frames=k_ctx,
             corruption_prob=corrupt_prob,
@@ -508,16 +535,40 @@ class VideoRFJiT3D(nn.Module):
                 hidden = int(embed_dim * mlp_ratio)
                 blk.mlp = type(blk.mlp)(embed_dim, hidden, embed_dim)
 
+    def _stack_volume(self, z_ctx, z_t):
+        # z_ctx: (B,K,C,H,W) (may be noised or clean), z_t: (B,C,H,W) -> (B,C,K+1,H,W)
+        vol_t = torch.cat([z_ctx, z_t.unsqueeze(1)], dim=1)        # (B, K+1, C, H, W)
+        return vol_t.permute(0, 2, 1, 3, 4).contiguous()           # (B, C, K+1, H, W)
+
+    def _cond(self, t_fut, t_ctx, B):
+        # build the (B, context_dim) conditioning vector. If context_dim==2 the
+        # FIRST slot is the context time, the LAST is the future time (JiT3D uses
+        # t[:,-1] as the RF/bridge time and t[:,:-1] as extra context).
+        if self.context_dim == 2:
+            return torch.stack([t_ctx.view(B).float(), t_fut.view(B).float()], dim=1)
+        return t_fut.view(B, 1).float()
+
     def forward(self, z_t, ctx, t):
-        # z_t: (B,C,H,W); ctx: (B,K,C,H,W); t: (B,)
+        # z_t: (B,C,H,W); ctx: (B,K,C,H,W); t: (B,). Inference / single-time path:
+        # context is assumed CLEAN -> context time = 1 (fully denoised) when decoupled.
         B = z_t.shape[0]
-        # stack [context frames ..., noisy target] along time -> (B, K+1, C, H, W)
-        vol_t = torch.cat([ctx, z_t.unsqueeze(1)], dim=1)
-        vol = vol_t.permute(0, 2, 1, 3, 4).contiguous()  # (B, C, T, H, W)
-        t_in = t.view(B, 1).float()                     # (B, 1) -> context_dim=1
-        out = self.jit(vol, t_in)                        # (B, C, T, H, W)
+        vol = self._stack_volume(ctx, z_t)
+        s = torch.ones(B, device=z_t.device, dtype=torch.float32)  # clean context
+        t_in = self._cond(t, s, B)
+        out = self.jit(vol, t_in)                        # (B, C, K+1, H, W)
         x_pred = out[:, :, self.k_ctx:, :, :]           # keep target slice
         return x_pred.flatten(1, 2)                     # (B, C, H, W)
+
+    def forward_joint(self, z_ctx, z_t, t_fut, t_ctx):
+        # TRAIN-time joint path: noised context (RF @ t_ctx) + noised future (bridge @ t_fut).
+        # Returns (ctx_pred (B,K,C,H,W), fut_pred (B,C,H,W)) — clean-frame predictions.
+        B = z_t.shape[0]
+        vol = self._stack_volume(z_ctx, z_t)
+        t_in = self._cond(t_fut, t_ctx, B)
+        out = self.jit(vol, t_in)                        # (B, C, K+1, H, W)
+        ctx_pred = out[:, :, :self.k_ctx, :, :]         # (B, C, K, H, W)
+        fut_pred = out[:, :, self.k_ctx:, :, :].flatten(1, 2)  # (B, C, H, W)
+        return ctx_pred.permute(0, 2, 1, 3, 4).contiguous(), fut_pred   # (B,K,C,H,W), (B,C,H,W)
 
     def get_velocity(self, z_t, ctx, t):
         x_pred = self.forward(z_t, ctx, t)
@@ -757,7 +808,7 @@ def augment_context(ctx, model=None, extra=None, training=True):
             if mask.any():
                 sur_ctx = torch.stack([extra[mask], ctx[mask, 0]], dim=1)  # Bm,K,C,H,W
                 with torch.no_grad():
-                    pred = sample_step(model, sur_ctx, ODE_STEPS, guidance=1.0)
+                    pred = sample_step(model, sur_ctx, SELFFEED_ODE_STEPS if SELFFEED_ODE_STEPS > 0 else ODE_STEPS, guidance=1.0)
                 # ERROR GATING: only self-feed samples whose surrogate prediction
                 # is accurate enough (low MSE vs the real frame). Adaptively
                 # self-feeds on easy/sparse data (good preds) and skips on
@@ -883,6 +934,38 @@ def _flow_loss_term(model, z_t, tgt, ctx_aug, t, eps):
 
 
 # --------------------------------------------------------------------------- #
+# 3b. JOINT-OBJECTIVE loss components (RF context reconstruction + bridge future)
+# --------------------------------------------------------------------------- #
+def _bridge_future_loss(fut_pred, tgt, t):
+    """Bridge x-prediction loss on the FUTURE slot (matches _flow_loss_term's
+    bridge branch). fut_pred/tgt: (B,C,H,W); t: (B,). Returns (loss_scalar, fut_pred)."""
+    if FLOW == "bridge":
+        if BRIDGE_LOSS == "ivar":
+            c_t, _ = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+            w = (1.0 / (c_t ** 2)).clamp(max=BRIDGE_WCLAMP)
+        elif BRIDGE_LOSS == "uniform":
+            w = torch.ones_like(t)
+        else:  # "vloss"
+            c_t, cp_over_c = bridge_coeffs(t, BRIDGE_SIGMA, BRIDGE_SIGMA_MIN)
+            w = ((1.0 - t * cp_over_c) ** 2).clamp(max=BRIDGE_WCLAMP)
+        loss = (((fut_pred - tgt) ** 2).mean(dim=(1, 2, 3)) * w).mean()
+        return loss.float(), fut_pred
+    # RF future (if FLOW=rf): velocity loss, fut_pred already predicts clean y.
+    w = (1.0 / (1.0 - t).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)
+    loss = (((fut_pred - tgt) ** 2).mean(dim=(1, 2, 3)) * w).mean()
+    return loss.float(), fut_pred
+
+
+def _rf_context_loss(ctx_pred, ctx_clean, s):
+    """Linear-rectified-flow velocity loss on the CONTEXT slots (endpoint
+    reparameterization): the net predicts clean ctx from z_ctx=(1-s)eps+s*ctx.
+    ctx_pred/ctx_clean: (B,K,C,H,W); s: (B,). Returns loss_scalar."""
+    w = (1.0 / (1.0 - s).clamp(min=0.05) ** 2).clamp(max=RF_WCLAMP)   # (B,)
+    loss = ((ctx_pred - ctx_clean) ** 2).mean(dim=(1, 2, 3, 4)) * w    # (B,)
+    return loss.mean().float()
+
+
+# --------------------------------------------------------------------------- #
 # 4. TRAINING
 # --------------------------------------------------------------------------- #
 def train(data):
@@ -891,12 +974,15 @@ def train(data):
         model = VideoRF3D(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS,
                           latent_blur_sigma=LATENT_BLUR).to(DEVICE)
     elif ARCH == "jit3d":
+        # JOINT_DECOPLE -> the net sees BOTH a context-time and a future-time
+        # (context_dim=2); otherwise the RF/bridge time only (context_dim=1).
+        _cdim = 2 if (JOINT_GEN and JOINT_DECOUPLE) else 1
         model = VideoRFJiT3D(
             K_CTX, C_CHAN, IMG,
             embed_dim=JIT_EMBED_DIM, depth=JIT_DEPTH, num_heads=JIT_HEADS,
             patch_t=JIT_PATCH_T, patch_hw=JIT_PATCH_HW, mlp_ratio=JIT_MLP_RATIO,
             corrupt_prob=JIT_CORRUPT_PROB, corrupt_embed=JIT_CORRUPT_EMBED,
-            corrupt_block0=JIT_CORRUPT_BLOCK0,
+            corrupt_block0=JIT_CORRUPT_BLOCK0, context_dim=_cdim,
         ).to(DEVICE)
     else:
         model = VideoRF(K_CTX, C_CHAN, ch=MODEL_CH, n_blocks=MODEL_BLOCKS).to(DEVICE)
@@ -923,6 +1009,40 @@ def train(data):
         t = torch.rand(BATCH, device=DEVICE)
         eps = (ctx[:, -1] + SRC_NOISE * torch.randn_like(tgt)) if FLOW_SOURCE == "lastctx" else torch.randn_like(tgt)
         z_t = _make_zt(t, tgt, eps)
+        # ------------------------------------------------------------------ #
+        # JOINT RF-context-generation + bridge-future-prediction objective
+        # (user idea): the net jointly DENOISES the context (linear RF, learns to
+        # generate data from scratch) AND predicts the future (bridge). Loss =
+        # bridge_loss(future) + JOINT_CTX_WEIGHT * rf_loss(context). The context
+        # RF time s is biased closer to data than t ("generate data first, then
+        # predict"). Inference rollout is unchanged (predict from clean context).
+        # ------------------------------------------------------------------ #
+        if JOINT_GEN and ARCH == "jit3d":
+            # context RF time s: "closer to data" than the future time t.
+            if JOINT_COUPLE:
+                s = (t + JOINT_LEAD).clamp(max=1.0)          # context leads toward data by JOINT_LEAD
+            else:
+                s = torch.rand(BATCH, device=DEVICE) * (1.0 - JOINT_CTX_TMIN) + JOINT_CTX_TMIN  # U(TMIN,1)
+            eps_ctx = torch.randn_like(ctx)                 # (B,K,C,H,W) per-slot RF noise source
+            z_ctx = (1.0 - s).view(BATCH, 1, 1, 1, 1) * eps_ctx + s.view(BATCH, 1, 1, 1, 1) * ctx   # RF noised context
+            if JOINT_LAST_ONLY and ctx.shape[1] > 1:
+                # only RF-noise the most-recent slot (holds the model's own output at inference)
+                keep = [k for k in range(ctx.shape[1] - 1)]
+                z_ctx = torch.cat([ctx[:, keep], z_ctx[:, -1:]], dim=1)
+            with _amp():
+                ctx_pred, fut_pred = model.forward_joint(z_ctx, z_t, t, s)
+                loss_fut, _ = _bridge_future_loss(fut_pred, tgt, t)
+                loss_ctx = _rf_context_loss(ctx_pred, ctx, s)
+                loss = loss_fut + JOINT_CTX_WEIGHT * loss_ctx
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+            sched.step()
+            last_loss = loss.item()
+            if (step + 1) % 500 == 0:
+                print(f"  step {step+1:4d}/{TRAIN_STEPS}  loss={last_loss:.5f} (fut={loss_fut.item():.5f} ctx={loss_ctx.item():.5f})", flush=True)
+            continue
         ctx_aug = augment_context(ctx, model=model, extra=extra, training=True)
         # classifier-free guidance: per-sample context dropout (train unconditional path)
         if UNCOND_PROB > 0:
@@ -1151,7 +1271,11 @@ def main():
     print(f"TECHNIQUE={TECHNIQUE} SIGMA={SIGMA} BLUR_SIGMA={BLUR_SIGMA} "
           f"IMG={IMG} C_CHAN={C_CHAN} K_CTX={K_CTX} ARCH={ARCH} FLOW={FLOW} "
           f"BRIDGE_LOSS={BRIDGE_LOSS} BRIDGE_SIGMA={BRIDGE_SIGMA} "
-          f"BRIDGE_WCLAMP={BRIDGE_WCLAMP} device={DEVICE}", flush=True)
+          f"BRIDGE_WCLAMP={BRIDGE_WCLAMP} device={DEVICE} "
+          f"JOINT_GEN={JOINT_GEN} JOINT_CTX_W={JOINT_CTX_WEIGHT} "
+          f"JOINT_COUPLE={JOINT_COUPLE} JOINT_LEAD={JOINT_LEAD} "
+          f"JOINT_TMIN={JOINT_CTX_TMIN} JOINT_DECOUPLE={JOINT_DECOUPLE} "
+          f"JOINT_LAST_ONLY={JOINT_LAST_ONLY}", flush=True)
 
     print("[data] generating train + holdout video...", flush=True)
     train_data = VideoSequenceData(N_TRAJ_TRAIN, TRAJ_LEN, SEED + 100,
